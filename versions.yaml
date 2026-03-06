@@ -3,7 +3,7 @@
 
 module-sets:
   obi:
-    version: v0.5.0
+    version: v0.6.0
     modules:
       - go.opentelemetry.io/obi
 excluded-modules:
@@ -22,11 +22,13 @@ excluded-modules:
   - go.opentelemetry.io/obi/configs/offsets/sarama
   - go.opentelemetry.io/obi/configs/offsets/shopify
   - go.opentelemetry.io/obi/internal/test/benchmarks/goshorturl
+  - go.opentelemetry.io/obi/internal/test/benchmarks/goshorturl/memsql
   - go.opentelemetry.io/obi/internal/test/integration/components/go_grpc_server_mux
   - go.opentelemetry.io/obi/internal/test/integration/components/go_http2/client
   - go.opentelemetry.io/obi/internal/test/integration/components/go_http2/server
   - go.opentelemetry.io/obi/internal/test/integration/components/go_otel
   - go.opentelemetry.io/obi/internal/test/integration/components/go_otel_grpc
+  - go.opentelemetry.io/obi/internal/test/integration/components/go_simple_grpc
   - go.opentelemetry.io/obi/internal/test/integration/components/gokafka
   - go.opentelemetry.io/obi/internal/test/integration/components/gokafka-seg
   - go.opentelemetry.io/obi/internal/test/integration/components/gomongo
