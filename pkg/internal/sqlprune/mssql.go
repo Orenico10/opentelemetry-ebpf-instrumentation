@@ -99,10 +99,14 @@ func parseMSSQLError(buf []uint8) *request.SQLError {
 		}
 		message := string(utf16.Decode(u16s))
 
-		return &request.SQLError{
-			Code:    uint16(code),
+		sqlErr := &request.SQLError{
 			Message: message,
 		}
+		// MSSQL error numbers are 4 bytes; only assign Code when it fits in 16 bits
+		if code <= 0xFFFF {
+			sqlErr.Code = uint16(code)
+		}
+		return sqlErr
 	}
 
 	return nil

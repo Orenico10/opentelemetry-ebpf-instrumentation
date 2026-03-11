@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 )
 
 func TestIsMSSQL(t *testing.T) {
@@ -65,7 +67,7 @@ func TestIsMSSQL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isMSSQL(tt.buf))
+			assert.Equal(t, tt.want, isMSSQL(largebuf.NewLargeBufferFrom(tt.buf)))
 		})
 	}
 }
@@ -127,7 +129,7 @@ func TestMSSQLBatchParsing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			op, table, stmt := mssqlPreparedStatements(tt.buf)
+			op, table, stmt := mssqlPreparedStatements(largebuf.NewLargeBufferFrom(tt.buf))
 			assert.Equal(t, tt.wantOp, op)
 			assert.Equal(t, tt.wantTable, table)
 			assert.Equal(t, tt.wantStmt, stmt)
@@ -199,7 +201,7 @@ func TestParseHandleFromExecute(t *testing.T) {
 			wantHandle: 456,
 		},
 		{
-			name: "too short",
+			name:       "too short",
 			payload:    []byte{0, 0, 0x26, 1, 2, 3},
 			wantHandle: 0,
 		},
@@ -246,8 +248,8 @@ func TestParseHandleFromPrepareResponse(t *testing.T) {
 			wantHandle: 1011,
 		},
 		{
-			name: "no return value token",
-			buf: []byte{0x04, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00},
+			name:       "no return value token",
+			buf:        []byte{0x04, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00},
 			wantHandle: 0,
 		},
 	}

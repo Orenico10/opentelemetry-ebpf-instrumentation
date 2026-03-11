@@ -9,6 +9,7 @@ import (
 	"unicode/utf16"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 	"go.opentelemetry.io/obi/pkg/internal/sqlprune"
 )
 
@@ -26,38 +27,62 @@ const (
 	kMSSQLProcIDPrepare  = 11
 	kMSSQLProcIDExecute  = 12
 	kMSSQLProcIDPrepExec = 13
+
+	// TDS Token types
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/7091f6f6-b83d-4ed2-afeb-ba5013dfb18f
+	kMSSQLTokenReturnValue = 0xAC
+
+	// Fixed lengths for TDS RETURNVALUE (0xAC) token fields that follow the name
+	kMSSQLStatusLen   = 1
+	kMSSQLUserTypeLen = 4
+	kMSSQLFlagsLen    = 2
+	// Sum of Status, UserType, and Flags fields
+	kMSSQLReturnValueMetadataLen = kMSSQLStatusLen + kMSSQLUserTypeLen + kMSSQLFlagsLen
 )
 
-func isMSSQL(b []byte) bool {
-	if len(b) < kMSSQLHeaderLen {
+func isMSSQL(b *largebuf.LargeBuffer) bool {
+	if b.Len() < kMSSQLHeaderLen {
 		return false
 	}
 
 	// Check for valid packet types
-	pktType := b[0]
+	pktType, err := b.U8At(0)
+	if err != nil {
+		return false
+	}
 	if pktType != kMSSQLBatch && pktType != kMSSQLRPC && pktType != kMSSQLResponse {
 		return false
 	}
 
 	// Status byte check: upper 4 bits are reserved and should be 0.
 	// This helps filter out random binary data that might match the packet type.
-	status := b[1]
+	status, err := b.U8At(1)
+	if err != nil {
+		return false
+	}
 	if (status & 0xF0) != 0 {
 		return false
 	}
 
 	// Length is big-endian in TDS. It's the length of the packet including the header.
-	length := binary.BigEndian.Uint16(b[2:4])
+	length, err := b.U16BEAt(2)
+	if err != nil {
+		return false
+	}
 	// The length must be at least the header length.
 	// We also add an upper bound to avoid misinterpreting other protocols as MSSQL.
 	// The default TDS packet size is 4096, but can be negotiated up to 32767.
 	// We'll use a generous upper bound.
-	if length < kMSSQLHeaderLen || length > 32768 {
+	if length < uint16(kMSSQLHeaderLen) || length > 32768 {
 		return false
 	}
 
 	// The Window byte (at offset 7) is currently unused and should be 0.
-	return b[7] == 0
+	window, err := b.U8At(7)
+	if err != nil {
+		return false
+	}
+	return window == 0
 }
 
 func ucs2ToUTF8(b []byte) string {
@@ -71,50 +96,53 @@ func ucs2ToUTF8(b []byte) string {
 	return string(utf16.Decode(u16s))
 }
 
-func mssqlPreparedStatements(b []byte) (string, string, string) {
-	if len(b) <= kMSSQLHeaderLen {
+func mssqlPreparedStatements(b *largebuf.LargeBuffer) (string, string, string) {
+	if b.Len() <= kMSSQLHeaderLen {
 		return "", "", ""
 	}
 
-	pktType := b[0]
+	pktType, _ := b.U8At(0)
 	if pktType == kMSSQLBatch {
 		// SQL Batch
-		payload := b[kMSSQLHeaderLen:]
+		payload, _ := b.UnsafeViewAt(kMSSQLHeaderLen, b.Len()-kMSSQLHeaderLen)
 		stmt := ucs2ToUTF8(payload)
-		return detectSQL(stmt)
+		return detectSQL([]byte(stmt))
 	}
 
 	return "", "", ""
 }
 
-func handleMSSQL(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer []byte) (request.Span, error) {
+func handleMSSQL(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer) (request.Span, error) {
 	var (
 		op, table, stmt string
 		span            request.Span
 	)
 
-	if len(requestBuffer) < kMSSQLHeaderLen {
+	if requestBuffer.Len() < kMSSQLHeaderLen {
 		slog.Debug("MSSQL request too short")
 		return span, errFallback
 	}
 
-	pktType := requestBuffer[0]
+	reqRaw := requestBuffer.UnsafeView()
+	respRaw := responseBuffer.UnsafeView()
+
+	pktType := reqRaw[0]
 
 	switch pktType {
 	case kMSSQLBatch:
 		op, table, stmt = mssqlPreparedStatements(requestBuffer)
 	case kMSSQLRPC:
-		procID, payload := parseMSSQLRPC(requestBuffer)
+		procID, payload := parseMSSQLRPC(reqRaw)
 		switch procID {
 		case kMSSQLProcIDPrepExec:
 			// Extract SQL from payload
 			text := ucs2ToUTF8(payload)
-			op, table, stmt = detectSQL(text)
+			op, table, stmt = detectSQL([]byte(text))
 		case kMSSQLProcIDPrepare:
 			// Extract SQL and cache it
 			text := ucs2ToUTF8(payload)
-			_, _, stmt = detectSQL(text)
-			handle := parseHandleFromPrepareResponse(responseBuffer)
+			_, _, stmt = detectSQL([]byte(text))
+			handle := parseHandleFromPrepareResponse(respRaw)
 			if handle != 0 && stmt != "" {
 				parseCtx.mssqlPreparedStatements.Add(mssqlPreparedStatementsKey{
 					connInfo: event.ConnInfo,
@@ -142,8 +170,8 @@ func handleMSSQL(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffe
 		return span, errFallback
 	}
 
-	sqlCommand := sqlprune.SQLParseCommandID(request.DBMSSQL, requestBuffer)
-	sqlError := sqlprune.SQLParseError(request.DBMSSQL, responseBuffer)
+	sqlCommand := sqlprune.SQLParseCommandID(request.DBMSSQL, reqRaw)
+	sqlError := sqlprune.SQLParseError(request.DBMSSQL, respRaw)
 
 	return TCPToSQLToSpan(event, op, table, stmt, request.DBMSSQL, sqlCommand, sqlError), nil
 }
@@ -221,9 +249,10 @@ func parseHandleFromPrepareResponse(b []byte) uint32 {
 	}
 	data := b[kMSSQLHeaderLen:]
 
-	// Scan for 0xAC (RETURNVALUE)
+	// Scan for RETURNVALUE token (0xAC)
+	// This token is used to send the return value of an RPC or UDF back to the client.
 	for i := 0; i < len(data); i++ {
-		if data[i] == 0xAC {
+		if data[i] == kMSSQLTokenReturnValue {
 			curr := data[i+1:]
 			if len(curr) < 3 {
 				continue
@@ -233,17 +262,17 @@ func parseHandleFromPrepareResponse(b []byte) uint32 {
 			// NameLen (1)
 			nameLen := int(curr[0])
 			curr = curr[1:]
-			if len(curr) < nameLen*2+7 {
+			if len(curr) < nameLen*2+kMSSQLReturnValueMetadataLen {
 				continue
 			}
 			curr = curr[nameLen*2:] // skip name
 
 			// Status (1)
-			curr = curr[1:]
+			curr = curr[kMSSQLStatusLen:]
 			// UserType (4)
-			curr = curr[4:]
+			curr = curr[kMSSQLUserTypeLen:]
 			// Flags (2)
-			curr = curr[2:]
+			curr = curr[kMSSQLFlagsLen:]
 
 			// TypeInfo
 			if len(curr) < 1 {
