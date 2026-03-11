@@ -18,7 +18,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"strings"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -29,6 +28,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/config"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
@@ -56,7 +56,7 @@ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.R
 	disabledRouteHarvesting := false
 
 	for _, lang := range cfg.Discovery.DisabledRouteHarvesters {
-		if strings.ToLower(lang) == "go" {
+		if lang == services.RouteHarvesterLanguageGo {
 			disabledRouteHarvesting = true
 			break
 		}
@@ -84,18 +84,24 @@ func (p *Tracer) supportsContextPropagation() bool {
 	return !ebpfcommon.IntegrityModeOverride && ebpfcommon.SupportsContextPropagationWithProbe(p.log)
 }
 
-func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
+func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	if !p.supportsContextPropagation() {
 		p.log.Info("Kernel in lockdown mode or missing CAP_SYS_ADMIN.")
 	}
 
-	return LoadBpf()
+	spec, err := LoadBpf()
+	if err != nil {
+		return nil, err
+	}
+
+	return []*ebpfcommon.SpecBundle{{
+		Spec:      spec,
+		Objects:   &p.bpfObjects,
+		Constants: p.constants(),
+	}}, nil
 }
 
-func (p *Tracer) SetupTailCalls() {
-}
-
-func (p *Tracer) Constants() map[string]any {
+func (p *Tracer) constants() map[string]any {
 	blackBoxCP := uint32(0)
 	if p.cfg.DisableBlackBoxCP {
 		blackBoxCP = uint32(1)
@@ -119,6 +125,8 @@ func (p *Tracer) Constants() map[string]any {
 		"g_bpf_loop_enabled":        p.supportsBPFLoop,
 	}
 }
+
+func (p *Tracer) SetupTailCalls() {}
 
 func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offsets) {
 	offTable := BpfOffTableT{}
@@ -246,10 +254,6 @@ func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offset
 
 func (p *Tracer) ProcessBinary(_ *exec.FileInfo) {}
 
-func (p *Tracer) BpfObjects() any {
-	return &p.bpfObjects
-}
-
 func (p *Tracer) AddCloser(c ...io.Closer) {
 	p.closers = append(p.closers, c...)
 }
@@ -258,8 +262,17 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
 	m := map[string][]*ebpfcommon.ProbeDesc{
 		// Go runtime
 		"runtime.newproc1": {{
-			Start: p.bpfObjects.ObiUprobeProcNewproc1,
-			End:   p.bpfObjects.ObiUprobeProcNewproc1Ret,
+			Start: p.bpfObjects.ObiUprobeRuntimeNewproc1,
+			End:   p.bpfObjects.ObiUprobeRuntimeNewproc1Return,
+		}},
+		"runtime.casgstatus": {{
+			Start: p.bpfObjects.ObiUprobeRuntimeCasgstatus,
+		}},
+		"runtime.mstart1": {{
+			Start: p.bpfObjects.ObiUprobeRuntimeMstart1,
+		}},
+		"runtime.mexit": {{
+			Start: p.bpfObjects.ObiUprobeRuntimeMexit,
 		}},
 		// Go net/http
 		"net/http.serverHandler.ServeHTTP": {{

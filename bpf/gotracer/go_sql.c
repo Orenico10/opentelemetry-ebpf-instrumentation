@@ -37,7 +37,7 @@ static __always_inline void *get_mysql_conn_ptr(u64 driver_conn_ptr) {
     off_table_t *ot = get_offsets_table();
 
     // Get driverConn.ci offset
-    u64 ci_offset = go_offset_of(ot, (go_offset){.v = _driverconn_ci_pos});
+    const u64 ci_offset = go_offset_of(ot, (go_offset){.v = _driverconn_ci_pos});
     if (!ci_offset) {
         bpf_dbg_printk("can't get driverConn.ci offset");
         return NULL;
@@ -54,7 +54,7 @@ static __always_inline void *get_mysql_conn_ptr(u64 driver_conn_ptr) {
         return NULL;
     }
 
-    u64 mysql_type_addr = go_offset_of(ot, (go_offset){.v = _mysql_conn_type_off});
+    const u64 mysql_type_addr = go_offset_of(ot, (go_offset){.v = _mysql_conn_type_off});
     if (!mysql_type_addr) {
         bpf_dbg_printk("can't read mysql.mysqlConn offset");
         return NULL;
@@ -239,7 +239,7 @@ set_sql_info(void *goroutine_addr, void *driver_conn, void *sql_param, void *que
 
 // Common SQL query return handler.
 // Works for both database/sql and pgx.
-static __always_inline int process_sql_return(void *goroutine_addr, void *err_ptr, u8 conn_type) {
+static __always_inline int process_sql_return(void *goroutine_addr, u8 error, u8 conn_type) {
     go_addr_key_t g_key = {};
     go_addr_key_from_id(&g_key, goroutine_addr);
 
@@ -257,7 +257,7 @@ static __always_inline int process_sql_return(void *goroutine_addr, void *err_pt
         trace->start_monotime_ns = invocation->start_monotime_ns;
         trace->end_monotime_ns = bpf_ktime_get_ns();
 
-        trace->status = (err_ptr != NULL);
+        trace->status = error;
         trace->tp = invocation->tp;
 
         u64 query_len = invocation->query_len;
@@ -343,13 +343,13 @@ int obi_uprobe_execDC(struct pt_regs *ctx) {
 
 SEC("uprobe/queryDC")
 int obi_uprobe_queryReturn(struct pt_regs *ctx) {
-    bpf_dbg_printk("=== uprobe/queryDC ===");
+    bpf_dbg_printk("=== uprobe/queryDC ret ===");
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     bpf_dbg_printk("goroutine_addr=%lx", goroutine_addr);
 
     // queryDC returns (*Rows, error)
-    void *err_ptr = GO_PARAM2(ctx);
-    return process_sql_return(goroutine_addr, err_ptr, SQL_CONN_TYPE_DATABASE_SQL);
+    void *resp_ptr = GO_PARAM1(ctx);
+    return process_sql_return(goroutine_addr, resp_ptr == 0, SQL_CONN_TYPE_DATABASE_SQL);
 }
 
 SEC("uprobe/pgx_Query_return")
@@ -360,7 +360,7 @@ int obi_uprobe_pgx_Query_return(struct pt_regs *ctx) {
 
     // pgx.Conn.Query returns (Rows, error)
     void *err_ptr = GO_PARAM3(ctx);
-    return process_sql_return(goroutine_addr, err_ptr, SQL_CONN_TYPE_PGX);
+    return process_sql_return(goroutine_addr, err_ptr != 0, SQL_CONN_TYPE_PGX);
 }
 
 SEC("uprobe/pq_network_return")
@@ -373,7 +373,7 @@ int obi_uprobe_pq_network_return(struct pt_regs *ctx) {
 
     // network returns (string, string) where 2nd return is address ("host:port")
     void *address_ptr = (void *)GO_PARAM3(ctx);
-    u64 address_len = (u64)GO_PARAM4(ctx);
+    const u64 address_len = (u64)GO_PARAM4(ctx);
 
     bpf_dbg_printk("address_ptr=%llx, address_len=%d", address_ptr, address_len);
 

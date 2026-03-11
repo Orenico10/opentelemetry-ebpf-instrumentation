@@ -24,6 +24,7 @@ import (
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/ebpf/common/dnsparser"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
@@ -112,14 +113,14 @@ func GenerateTracesWithAttributes(
 	cache *expirable2.LRU[svc.UID, []attribute.KeyValue],
 	svc *svc.Attrs,
 	envResourceAttrs []attribute.KeyValue,
-	hostID string,
+	nodeMeta *meta.NodeMeta,
 	spans []TraceSpanAndAttributes,
 	reporterName string,
 	extraResAttrs ...attribute.KeyValue,
 ) ptrace.Traces {
 	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
-	resourceAttrs := TraceAppResourceAttrs(cache, hostID, svc)
+	resourceAttrs := TraceAppResourceAttrs(cache, nodeMeta, svc)
 	resourceAttrs = append(resourceAttrs, envResourceAttrs...)
 	resourceAttrsMap := AttrsToMap(resourceAttrs)
 	resourceAttrsMap.PutStr(string(semconv.OTelScopeNameKey), reporterName)
@@ -211,17 +212,17 @@ func createSubSpans(span *request.Span, parentSpanID pcommon.SpanID, traceID pco
 
 var emptyUID = svc.UID{}
 
-func TraceAppResourceAttrs(cache *expirable2.LRU[svc.UID, []attribute.KeyValue], hostID string, service *svc.Attrs) []attribute.KeyValue {
+func TraceAppResourceAttrs(cache *expirable2.LRU[svc.UID, []attribute.KeyValue], nodeMeta *meta.NodeMeta, service *svc.Attrs) []attribute.KeyValue {
 	// TODO: remove?
 	if service.UID == emptyUID {
-		return otelcfg.GetAppResourceAttrs(hostID, service)
+		return otelcfg.GetAppResourceAttrs(nodeMeta, service)
 	}
 
 	attrs, ok := cache.Get(service.UID)
 	if ok {
 		return attrs
 	}
-	attrs = otelcfg.GetAppResourceAttrs(hostID, service)
+	attrs = otelcfg.GetAppResourceAttrs(nodeMeta, service)
 	cache.Add(service.UID, attrs)
 
 	return attrs
@@ -418,6 +419,53 @@ func TraceAttributesSelector(span *request.Span, optionalAttrs map[attr.Name]str
 			attrs = append(attrs, request.AWSExtendedRequestID(sqs.Meta.ExtendedRequestID))
 			attrs = append(attrs, request.AWSSQSQueueURL(sqs.QueueURL))
 		}
+
+		if span.SubType == request.HTTPSubtypeOpenAI && span.OpenAI != nil {
+			ai := span.OpenAI
+			attrs = append(attrs, semconv.GenAIProviderNameOpenAI)
+			attrs = append(attrs, semconv.GenAIOperationNameKey.String(ai.OperationName))
+			attrs = append(attrs, semconv.GenAIResponseID(ai.ID))
+			if ai.OperationName == "conversation" || ai.OperationName == "chatkit.session" || ai.OperationName == "chatkit.thread" {
+				attrs = append(attrs, semconv.GenAIConversationID(ai.ID))
+			}
+			attrs = append(attrs, semconv.GenAIRequestModel(ai.Request.Model))
+			attrs = append(attrs, semconv.GenAIResponseModel(ai.ResponseModel))
+			if ai.FrequencyPenalty > 0.0 {
+				attrs = append(attrs, semconv.GenAIRequestFrequencyPenalty(ai.FrequencyPenalty))
+			}
+			if ai.Temperature > 0.0 {
+				attrs = append(attrs, semconv.GenAIRequestTemperature(ai.Temperature))
+			} else if ai.Request.Temperature != 0 {
+				attrs = append(attrs, semconv.GenAIRequestTemperature(ai.Request.Temperature))
+			}
+			if ai.TopP > 0.0 {
+				attrs = append(attrs, semconv.GenAIRequestTopP(ai.TopP))
+			}
+			attrs = append(attrs, semconv.GenAIUsageInputTokens(ai.Usage.GetInputTokens()))
+			attrs = append(attrs, semconv.GenAIUsageOutputTokens(ai.Usage.GetOutputTokens()))
+			if _, ok := optionalAttrs[attr.GenAIInput]; ok {
+				attrs = append(attrs, semconv.GenAIInputMessagesKey.String(ai.Request.GetInput()))
+			}
+			if _, ok := optionalAttrs[attr.GenAIOutput]; ok {
+				attrs = append(attrs, semconv.GenAIOutputMessagesKey.String(ai.GetOutput()))
+			}
+			if _, ok := optionalAttrs[attr.GenAIInstructions]; ok {
+				if ai.Request.Instructions != "" {
+					attrs = append(attrs, semconv.GenAISystemInstructionsKey.String(ai.Request.Instructions))
+				}
+			}
+			if _, ok := optionalAttrs[attr.GenAIMetadata]; ok {
+				if len(ai.Metadata) > 0 {
+					attrs = append(attrs, request.Metadata(string(ai.Metadata)))
+				}
+			}
+			// add error info
+			if ai.Error.Type != "" {
+				attrs = append(attrs, semconv.ErrorTypeKey.String(ai.Error.Type))
+				attrs = append(attrs, semconv.ErrorMessage(ai.Error.Message))
+			}
+		}
+
 	case request.EventTypeGRPCClient:
 		attrs = []attribute.KeyValue{
 			semconv.RPCMethod(span.Path),

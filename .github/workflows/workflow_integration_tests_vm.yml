@@ -3,12 +3,6 @@ name: Pull request integration tests on VM
 on:
   push:
     branches: ["main", "release-*"]
-    paths:
-      - ".github/workflows/workflow_integration_tests_vm.yml"
-      - "bpf/**"
-      - "internal/test/integration/**"
-      - "internal/test/vm/**"
-      - "scripts/generate-integration-matrix.sh"
   pull_request:
     branches: ["main", "release-*"]
     paths:
@@ -23,6 +17,14 @@ on:
         description: "Git ref (commit, branch, or tag) to check out"
         required: false
         type: string
+    secrets:
+      DOCKER_TOKEN_EBPF_INSTRUMENTATION:
+        description: "Docker Hub token for pulling images (optional)"
+        required: false
+
+concurrency:
+  group: vm-integration-tests-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -31,10 +33,11 @@ jobs:
   vm-test-matrix:
     name: "Build VM integration matrix"
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -52,7 +55,7 @@ jobs:
           PARTITIONS: 5
         run: |
           echo -n "matrix=" >> $GITHUB_OUTPUT
-          make vm-integration-test-matrix-json >> $GITHUB_OUTPUT
+          make multiprocess-integration-test-matrix-json >> $GITHUB_OUTPUT
 
   test:
     name: kernel ${{ matrix.kernel.kernel-version }} ${{ matrix.kernel.arch }} ${{ matrix.test.description }}
@@ -64,6 +67,7 @@ jobs:
       # Required for uploading artifacts
       actions: write
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -116,32 +120,97 @@ jobs:
           docker builder prune -af || true
           df -h
 
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
+      - name: Check for Docker Hub token
+        id: check-docker-token
+        run: |
+          if [ -n "${DOCKER_TOKEN}" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN_EBPF_INSTRUMENTATION }}
+
+      - name: Log in to Docker Hub
+        if: steps.check-docker-token.outputs.has_token == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN_EBPF_INSTRUMENTATION }}
+
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0 # zizmor: ignore[cache-poisoning] go.sum verifies module integrity
         with:
           go-version-file: "go.mod"
-          cache: false
+          cache: true
+
+      - name: Go build cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3 # zizmor: ignore[cache-poisoning] go build cache is content-addressable and self-verifying
+        with:
+          path: ~/.cache/go-build
+          key: go-build-vm-integration-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: |
+            go-build-vm-integration-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Generate files
         run: make prereqs docker-generate
 
-      - name: Install QEMU and musl-tools
+      - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 musl-tools
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86
 
-      - name: Pre-compile Go integration tests
+      - name: Pre-compile Go integration tests and gotestsum
         run: |
           mkdir compiled-tests
-          CC=musl-gcc CGO_ENABLED=1 go test -c -ldflags="-s -w" -o compiled-tests/ ./internal/test/integration
+          CGO_ENABLED=0 go test -c -ldflags="-s -w" -o compiled-tests/ ./internal/test/integration
+          CGO_ENABLED=0 go build -C internal/tools -o ../../compiled-tests/gotestsum -ldflags="-s -w" gotest.tools/gotestsum
+
+      - name: Pre-build Docker images for VM tests
+        run: |
+          # Auto-discover Docker images from compose files and build them on
+          # the host at native speed, avoiding slow in-VM builds under QEMU
+          # TCG (software CPU emulation). Scans for services that have both a
+          # 'build: dockerfile:' and 'image: hatest-*', skipping entries with
+          # env var substitutions in the dockerfile path.
+          mapfile -t ENTRIES < <(
+            awk '
+              /^  [a-zA-Z]/ {
+                if (df && img && !(img in seen)) { seen[img]=1; print img "=" df }
+                df=""; img=""
+              }
+              /dockerfile:/ {
+                sub(/.*dockerfile: */, ""); gsub(/["'"'"']/, ""); sub(/^\.\/*/, "")
+                if ($0 !~ /\$\{/) df=$0
+              }
+              /image: *hatest-/ { sub(/.*image: */, ""); img=$0 }
+              END { if (df && img && !(img in seen)) print img "=" df }
+            ' internal/test/integration/docker-compose-multiexec*.yml | sort
+          )
+
+          echo "Discovered ${#ENTRIES[@]} Docker images to pre-build"
+          IMAGE_TAGS=()
+          for entry in "${ENTRIES[@]}"; do
+            tag="${entry%%=*}"
+            dockerfile="${entry#*=}"
+            echo "Building ${tag} from ${dockerfile}..."
+            docker build --quiet -t "${tag}" -f "${dockerfile}" .
+            IMAGE_TAGS+=("${tag}")
+          done
+
+          if [ ${#IMAGE_TAGS[@]} -gt 0 ]; then
+            echo "Saving ${#IMAGE_TAGS[@]} Docker images to tar..."
+            docker save "${IMAGE_TAGS[@]}" -o compiled-tests/docker-images.tar
+            echo "Docker images saved ($(du -h compiled-tests/docker-images.tar | cut -f1))"
+            docker builder prune -af
+          fi
 
       - name: Run VM integration tests (${{ matrix.test.description }})
-        timeout-minutes: 60
         env:
           # zizmor template-injection fixes: pass data as env vars
           MATRIX_ID: ${{ matrix.test.id }}
@@ -181,7 +250,7 @@ jobs:
           name: vm-integration-test-coverage-${{ matrix.kernel.kernel-version }}-${{ matrix.kernel.arch }}-${{ matrix.test.id }}-${{ github.run_number }}
 
       - name: Upload integration test logs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         if: always()
         with:
           name: vm-integration-test-logs-${{ matrix.kernel.kernel-version }}-${{ matrix.kernel.arch }}-${{ matrix.test.id }}-${{ github.run_number }}

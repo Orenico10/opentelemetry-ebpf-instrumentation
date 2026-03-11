@@ -6,13 +6,16 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_builtins.h>
 #include <bpfcore/bpf_helpers.h>
+#include <bpfcore/utils.h>
 
 #include <common/common.h>
 #include <common/http_types.h>
 #include <common/large_buffers.h>
 #include <common/ringbuf.h>
 #include <common/runtime.h>
-#include <common/trace_common.h>
+#include <common/trace_helpers.h>
+#include <common/trace_lifecycle.h>
+#include <common/trace_parent.h>
 
 #include <generictracer/maps/http_info_mem.h>
 
@@ -24,6 +27,8 @@
 #include <maps/accepted_connections.h>
 #include <maps/active_ssl_connections.h>
 #include <maps/ongoing_http.h>
+#include <maps/tp_info_mem.h>
+#include <maps/tp_char_buf_mem.h>
 
 volatile const u32 high_request_volume;
 
@@ -45,11 +50,6 @@ static __always_inline u32 trace_type_from_meta(http_connection_metadata_t *meta
     }
 
     return TRACE_TYPE_SERVER;
-}
-
-static __always_inline u8 already_tracked_http(const pid_connection_info_t *p_conn) {
-    http_info_t *http_info = bpf_map_lookup_elem(&ongoing_http, p_conn);
-    return (http_info && !(http_info->delayed || http_info->submitted));
 }
 
 static __always_inline void
@@ -83,7 +83,7 @@ http_get_or_create_trace_info(http_connection_metadata_t *meta,
         return;
     }
 
-    tp_p = tp_buf();
+    tp_p = (tp_info_pid_t *)tp_info_mem();
 
     if (!tp_p) {
         return;
@@ -130,7 +130,7 @@ http_get_or_create_trace_info(http_connection_metadata_t *meta,
 
     u8 skip_tp_parsing = 0;
 
-    // If we receive SSL request, we know that Beyla definitely didn't
+    // If we receive SSL request, we know that OBI definitely didn't
     // inject the traceparent via the header, so if we already have
     // info about this transaction keep that, don't parse headers. Istio
     // for example can forward headers as-is, which can give us a stale
@@ -147,14 +147,14 @@ http_get_or_create_trace_info(http_connection_metadata_t *meta,
         // for customers to enable it. Off by default.
         if (!capture_header_buffer) {
             if (meta) {
-                u32 type = trace_type_from_meta(meta);
+                const u32 type = trace_type_from_meta(meta);
                 set_trace_info_for_connection(conn, type, tp_p);
                 server_or_client_trace(meta->type, conn, tp_p, ssl, orig_dport);
             }
             return;
         }
 
-        unsigned char *buf = tp_char_buf();
+        unsigned char *buf = (unsigned char *)tp_char_buf_mem();
         if (buf) {
             const u16 buf_len = bytes_len & (TRACE_BUF_SIZE - 1);
             _Static_assert(TRACE_BUF_SIZE == 1024,
@@ -191,7 +191,7 @@ http_get_or_create_trace_info(http_connection_metadata_t *meta,
     }
 
     if (meta) {
-        u32 type = trace_type_from_meta(meta);
+        const u32 type = trace_type_from_meta(meta);
         set_trace_info_for_connection(conn, type, tp_p);
         // TODO: If the user code setup traceparent manually, don't interfere and add
         // something else with TC L7. The main challenge is that with kprobes, the
@@ -245,7 +245,7 @@ static __always_inline u8 http_will_complete(http_info_t *info, unsigned char *b
 }
 
 static __always_inline u8 is_duplicate_info(http_info_t *info) {
-    u64 ts = bpf_ktime_get_ns();
+    const u64 ts = bpf_ktime_get_ns();
     return info->start_monotime_ns && (ts >= info->start_monotime_ns) &&
            current_immediate_epoch(ts) == current_immediate_epoch(info->start_monotime_ns);
 }
@@ -309,7 +309,7 @@ static __always_inline http_info_t *get_or_set_http_info(http_info_t *info,
     if (packet_type == PACKET_TYPE_REQUEST) {
         http_info_t *old_info = bpf_map_lookup_elem(&ongoing_http, pid_conn);
         if (old_info && !old_info->submitted) {
-            u8 req_type = request_type_by_direction(direction, packet_type);
+            const u8 req_type = request_type_by_direction(direction, packet_type);
             if (!http_info_complete(old_info)) {
                 if (old_info->type == req_type && is_duplicate_info(old_info)) {
                     return 0;
@@ -401,7 +401,7 @@ static __always_inline void process_http_request(
 
     fixup_connection_info(&info->conn_info, info->type == EVENT_HTTP_CLIENT, orig_dport);
 
-    u64 start_time = bpf_ktime_get_ns();
+    const u64 start_time = bpf_ktime_get_ns();
     u64 req_time = start_time;
 
     if (info->type == EVENT_HTTP_REQUEST) {
@@ -429,34 +429,32 @@ static __always_inline void process_http_request(
 static __always_inline void process_http_response(http_info_t *info, const unsigned char *buf) {
     info->resp_len = 0;
     info->end_monotime_ns = bpf_ktime_get_ns();
-    info->status = 0;
-    info->status += (buf[RESPONSE_STATUS_POS] - '0') * 100;
-    info->status += (buf[RESPONSE_STATUS_POS + 1] - '0') * 10;
-    info->status += (buf[RESPONSE_STATUS_POS + 2] - '0');
-    if (info->status > MAX_HTTP_STATUS) { // we read something invalid
-        info->status = 0;
+
+    u16 status = 0;
+
+    status += (buf[RESPONSE_STATUS_POS] - '0') * 100;
+    status += (buf[RESPONSE_STATUS_POS + 1] - '0') * 10;
+    status += (buf[RESPONSE_STATUS_POS + 2] - '0');
+
+    if (status == 100 || status == 103 || status > MAX_HTTP_STATUS) {
+        status = 0;
     }
+
+    info->status = status;
 }
 
 static __always_inline void handle_http_response(unsigned char *small_buf,
                                                  pid_connection_info_t *pid_conn,
                                                  http_info_t *info,
-                                                 int orig_len,
-                                                 u8 direction,
-                                                 u8 ssl) {
+                                                 int orig_len) {
     process_http_response(info, small_buf);
     cleanup_http_request_data(pid_conn, info);
 
-    if ((direction != TCP_SEND) ||
-        high_request_volume /*|| (ssl != NO_SSL) || (orig_len < KPROBES_LARGE_RESPONSE_LEN)*/) {
+    if (high_request_volume) {
         finish_http(info, pid_conn);
     } else {
-        if (ssl) {
-            finish_http(info, pid_conn);
-        } else {
-            bpf_dbg_printk("Delaying finish http for large request, orig_len=%d", orig_len);
-            info->delayed = 1;
-        }
+        bpf_dbg_printk("Delaying finish http for large request, orig_len=%d", orig_len);
+        info->delayed = 1;
     }
 }
 
@@ -483,22 +481,49 @@ static __always_inline int http_send_large_buffer(http_info_t *req,
     large_buf->action = action;
     large_buf->tp = req->tp;
 
-    large_buf->len = bytes_len;
-    if (large_buf->len >= http_buffer_size) {
-        large_buf->len = http_buffer_size;
-        bpf_dbg_printk("WARN: buffer is full, truncating data");
-    }
-
-    bpf_probe_read(large_buf->buf, large_buf->len & k_large_buf_payload_max_size_mask, u_buf);
-
-    u32 total_size = sizeof(tcp_large_buffer_t);
-    total_size += large_buf->len > sizeof(void *) ? large_buf->len : sizeof(void *);
-
     req->has_large_buffers = true;
 
-    bpf_dbg_printk("sending large buffer, size=%d", bytes_len);
+    u32 available_bytes = bytes_len;
+    // limit by the userspace requested size
+    if (available_bytes > http_buffer_size) {
+        available_bytes = http_buffer_size;
+    }
+    // limit by the maximum bytes we can ever export
+    bpf_clamp_umax(available_bytes, k_large_buffer_read_limit);
 
-    bpf_ringbuf_output(&events, large_buf, total_size & k_large_buf_max_size_mask, get_flags());
+    bpf_dbg_printk("sending large buffer, total size=%d, packet_type=%d, direction %d",
+                   bytes_len,
+                   packet_type,
+                   direction);
+
+    const uint32_t niter = (available_bytes / k_large_buf_payload_max_size) +
+                           ((available_bytes % k_large_buf_payload_max_size) > 0);
+
+    int b = 0;
+    for (; b < niter; b++) {
+        const u32 offset = b * k_large_buf_payload_max_size;
+        if (offset >= k_large_buffer_read_limit) {
+            break;
+        }
+        u32 read_size = available_bytes;
+        bpf_clamp_umax(read_size, k_large_buf_payload_max_size);
+        bpf_probe_read(large_buf->buf, read_size, (void *)(&u_buf[offset]));
+
+        // left here intentionally for debugging
+        // bpf_dbg_printk("sending large buffer, size=%d, action=%d", read_size, action);
+
+        large_buf->len = read_size;
+
+        u32 total_size = sizeof(tcp_large_buffer_t);
+        total_size += large_buf->len > sizeof(void *) ? large_buf->len : sizeof(void *);
+
+        bpf_clamp_umax(total_size, k_large_buf_max_size);
+        bpf_ringbuf_output(&events, large_buf, total_size, get_flags());
+
+        available_bytes -= read_size;
+        large_buf->action = k_large_buf_action_append;
+    }
+
     return 0;
 }
 
@@ -509,7 +534,7 @@ static __always_inline int __obi_continue2_protocol_http(struct pt_regs *ctx,
     (void)ctx;
 
     if (meta) {
-        u32 type = trace_type_from_meta(meta);
+        const u32 type = trace_type_from_meta(meta);
         tp_info_pid_t *tp_p = trace_info_for_connection(&args->pid_conn.conn, type);
         if (tp_p) {
             info->tp = tp_p->tp;
@@ -659,9 +684,9 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
                                args->packet_type,
                                args->direction,
                                k_large_buf_action_init);
-        handle_http_response(
-            args->small_buf, &args->pid_conn, info, args->bytes_len, args->direction, args->ssl);
+        handle_http_response(args->small_buf, &args->pid_conn, info, args->bytes_len);
     } else if (still_reading(info)) {
+        // print here
         http_send_large_buffer(info,
                                (void *)args->u_buf,
                                args->bytes_len,
@@ -670,7 +695,9 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
                                k_large_buf_action_append);
 
         info->len += args->bytes_len;
+    } else if (still_responding(info)) {
         info->end_monotime_ns = bpf_ktime_get_ns();
+        info->resp_len += args->bytes_len;
     }
 
     return 0;

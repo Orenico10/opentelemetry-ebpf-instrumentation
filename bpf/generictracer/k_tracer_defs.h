@@ -8,10 +8,10 @@
 
 #include <common/connection_info.h>
 #include <common/http_types.h>
-#include <common/ringbuf.h>
+#include <common/protocol_http.h>
+#include <common/event_defs.h>
 #include <common/send_args.h>
 #include <common/tc_common.h>
-#include <common/trace_common.h>
 
 #include <generictracer/k_tracer_tailcall.h>
 #include <generictracer/protocol_common.h>
@@ -84,7 +84,7 @@ static __always_inline void handle_buf_with_connection(void *ctx,
 
 static __always_inline void
 read_skb_bytes(const void *skb, u32 offset, unsigned char *buf, const u32 len) {
-    u32 max = offset + len;
+    const u32 max = offset + len;
     int b = 0;
     for (; b < (FULL_BUF_SIZE / BUF_COPY_BLOCK_SIZE); b++) {
         if ((offset + (BUF_COPY_BLOCK_SIZE - 1)) >= max) {

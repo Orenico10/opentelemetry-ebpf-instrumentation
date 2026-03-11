@@ -28,7 +28,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
-	"go.opentelemetry.io/obi/pkg/buildinfo"
+	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/config"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
@@ -93,13 +93,13 @@ func omitFieldsForYAML(input any, omitFields map[string]struct{}) map[string]any
 	return result
 }
 
-func GetAppResourceAttrs(hostID string, service *svc.Attrs) []attribute.KeyValue {
-	return append(GetResourceAttrs(hostID, service),
+func GetAppResourceAttrs(nodeMeta *meta.NodeMeta, service *svc.Attrs) []attribute.KeyValue {
+	return append(GetResourceAttrs(nodeMeta, service),
 		semconv.ServiceInstanceID(service.UID.Instance),
 	)
 }
 
-func GetResourceAttrs(hostID string, service *svc.Attrs) []attribute.KeyValue {
+func GetResourceAttrs(nodeMeta *meta.NodeMeta, service *svc.Attrs) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(service.UID.Name),
 		// SpanMetrics requires an extra attribute besides service name
@@ -107,11 +107,12 @@ func GetResourceAttrs(hostID string, service *svc.Attrs) []attribute.KeyValue {
 		// so the service is visible in the ServicesList
 		// This attribute also allows that App O11y plugin shows this app as a Go application.
 		semconv.TelemetrySDKLanguageKey.String(service.SDKLanguage.String()),
-		// We set the SDK name as OBI, so we can distinguish OBI generated metrics from other SDKs
 		semconv.TelemetrySDKNameKey.String(attr.VendorSDKName),
-		semconv.TelemetrySDKVersion(buildinfo.Version),
+		semconv.TelemetrySDKVersion(attr.VendorSDKVersion),
+		semconv.TelemetryDistroName(attr.TelemetryDistroName),
+		semconv.TelemetryDistroVersion(attr.TelemetryDistroVersion),
 		semconv.HostName(service.HostName),
-		semconv.HostID(hostID),
+		semconv.HostID(nodeMeta.HostID),
 		semconv.OSTypeLinux,
 	}
 
@@ -121,6 +122,10 @@ func GetResourceAttrs(hostID string, service *svc.Attrs) []attribute.KeyValue {
 
 	for k, v := range service.Metadata {
 		attrs = append(attrs, k.OTEL().String(v))
+	}
+
+	for _, entry := range nodeMeta.Metadata {
+		attrs = append(attrs, entry.Key.OTEL().String(entry.Value))
 	}
 	return attrs
 }

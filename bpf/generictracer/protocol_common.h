@@ -9,7 +9,7 @@
 #include <common/iov_iter.h>
 #include <common/sock_port_ns.h>
 #include <common/http_types.h>
-#include <common/ringbuf.h>
+#include <common/event_defs.h>
 
 #include <generictracer/maps/connection_meta_mem.h>
 #include <generictracer/maps/iovec_mem.h>
@@ -40,8 +40,8 @@ static __always_inline u32 task_netns() {
 }
 
 static __always_inline u8 infer_packet_type(u8 direction, u16 port) {
-    u32 netns = task_netns();
-    bool is_server = is_listening(port, netns);
+    const u32 netns = task_netns();
+    const bool is_server = is_listening(port, netns);
 
     if ((direction == TCP_RECV && is_server) || (direction == TCP_SEND && !is_server)) {
         return PACKET_TYPE_REQUEST;

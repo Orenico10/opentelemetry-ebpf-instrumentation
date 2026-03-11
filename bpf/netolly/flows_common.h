@@ -86,6 +86,10 @@ const u8 ip4in6[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
 volatile const u32 sampling = 0;
 volatile const u8 trace_messages = 0;
 
+// Port guessing policy constants
+enum { PORT_GUESSING_NONE = 0, PORT_GUESSING_ORDINAL = 1 };
+volatile const u8 port_guessing = PORT_GUESSING_NONE;
+
 // we can safely assume that the passed address is IPv6 as long as we encode IPv4
 // as IPv6 during the creation of the flow_id.
 static inline s32 compare_ipv6(flow_id *fid) {
@@ -125,13 +129,13 @@ static inline u8 fill_conn_initiator_key(flow_id *id, conn_initiator_key *key) {
 }
 
 // returns INITIATOR_SRC or INITIATOR_DST, but might return INITIATOR_UNKNOWN
-// if the connection initiator couldn't be found. The user-space Beyla pipeline
+// if the connection initiator couldn't be found. The user-space OBI pipeline
 // will handle this last case heuristically
 static inline u8 get_connection_initiator(flow_id *id, u16 flags) {
     conn_initiator_key initiator_key;
     // from the initiator_key with sorted ip/ports, know the index of the
     // endpoint that that initiated the connection, which might be the low or the high address
-    u8 low_is_src = fill_conn_initiator_key(id, &initiator_key);
+    const u8 low_is_src = fill_conn_initiator_key(id, &initiator_key);
     u8 *initiator = (u8 *)bpf_map_lookup_elem(&conn_initiators, &initiator_key);
     u8 initiator_index = INITIATOR_UNKNOWN;
     if (initiator == NULL) {

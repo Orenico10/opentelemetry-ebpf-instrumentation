@@ -15,7 +15,6 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/gpuevent"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/logenricher"
-	"go.opentelemetry.io/obi/pkg/internal/ebpf/tctracer"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
 	msgh "go.opentelemetry.io/obi/pkg/internal/helpers/msg"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -149,9 +148,12 @@ func newCommonTracersGroup(cfg *obi.Config) []ebpf.Tracer {
 		tracers = append(tracers, tpinjector.New(cfg))
 	}
 
-	// Enables tctracer which handles context propagations via IP options only (TC egress/ingress)
-	if cfg.EBPF.ContextPropagation.HasIPOptions() {
-		tracers = append(tracers, tctracer.New(cfg))
+	// Enables log enricher which handles trace-log correlation
+	if cfg.EBPF.LogEnricher.Enabled() {
+		logEnricher := logenricher.New(cfg)
+		if logEnricher != nil {
+			tracers = append(tracers, logEnricher)
+		}
 	}
 
 	return tracers
@@ -170,14 +172,6 @@ func newGenericTracersGroup(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config,
 	// Enables GPU tracer
 	if cfg.EBPF.CudaInstrumentationEnabled() {
 		tracers = append(tracers, gpuevent.New(pidFilter, cfg, metrics))
-	}
-
-	// Enables log enricher which handles trace-log correlation
-	if cfg.EBPF.LogEnricher.Enabled() {
-		logEnricher := logenricher.New(cfg)
-		if logEnricher != nil {
-			tracers = append(tracers, logEnricher)
-		}
 	}
 
 	return tracers

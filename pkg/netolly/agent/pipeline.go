@@ -30,7 +30,7 @@ var newRingBufTracer = func(f *Flows, out *msg.Queue[[]*ebpf.Record]) swarm.RunF
 	return f.rbTracer.TraceLoop(out)
 }
 
-// buildPipeline defines the different nodes in the Beyla's NetO11y module,
+// buildPipeline defines the different nodes in the OBI's NetO11y module,
 // as well as how they are interconnected (in its Connect() method)
 func (f *Flows) buildPipeline(ctx context.Context) (*swarm.Runner, error) {
 	alog := alog()
@@ -95,8 +95,16 @@ func (f *Flows) buildPipeline(ctx context.Context) (*swarm.Runner, error) {
 	if filteredFlows == nil {
 		filteredFlows = msgh.QueueFromConfig[[]*ebpf.Record](f.cfg, "filteredFlows")
 	}
-	swi.Add(filter.ByAttribute(f.cfg.Filters.Network, nil, selectorCfg.ExtraGroupAttributesCfg, ebpf.RecordStringGetters, decoratedFlows, filteredFlows),
-		swarm.WithID("AttributeFilter"))
+	swi.Add(filter.ByAttribute(
+		f.cfg.Filters.Network,
+		nil,
+		selectorCfg.ExtraGroupAttributesCfg,
+		ebpf.RecordStringGetters(ebpf.RecordGettersConfig{
+			PortGuessPolicy: f.cfg.NetworkFlows.GuessPorts,
+		}),
+		decoratedFlows,
+		filteredFlows,
+	), swarm.WithID("AttributeFilter"))
 
 	// Terminal nodes export the flow record information out of the pipeline: OTEL, Prom and printer.
 	// Not all the nodes are mandatory here. Is the responsibility of each Provider function to decide
@@ -105,12 +113,14 @@ func (f *Flows) buildPipeline(ctx context.Context) (*swarm.Runner, error) {
 		Metrics:     &f.cfg.OTELMetrics,
 		SelectorCfg: selectorCfg,
 		CommonCfg:   &f.cfg.Metrics,
+		GuessPorts:  f.cfg.NetworkFlows.GuessPorts,
 	}, filteredFlows), swarm.WithID("OTelExporter"))
 
 	swi.Add(prom.NetPrometheusEndpoint(f.ctxInfo, &prom.NetPrometheusConfig{
 		Config:      &f.cfg.Prometheus,
 		SelectorCfg: selectorCfg,
 		CommonCfg:   &f.cfg.Metrics,
+		GuessPorts:  f.cfg.NetworkFlows.GuessPorts,
 	}, filteredFlows), swarm.WithID("PrometheusExporter"))
 
 	swi.Add(swarm.DirectInstance(export.FlowPrinterProvider(f.cfg.NetworkFlows.Print, filteredFlows)),

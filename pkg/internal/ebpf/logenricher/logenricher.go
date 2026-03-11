@@ -90,25 +90,27 @@ func New(cfg *obi.Config) *Tracer {
 	return tr
 }
 
-func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
-	return LoadBpf()
+func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
+	spec, err := LoadBpf()
+	if err != nil {
+		return nil, err
+	}
+	return []*ebpfcommon.SpecBundle{{
+		Spec:      spec,
+		Objects:   &p.bpfObjects,
+		Constants: p.constants(),
+	}}, nil
+}
+
+func (p *Tracer) constants() map[string]any {
+	return map[string]any{"g_bpf_debug": p.cfg.EBPF.BpfDebug}
 }
 
 func (p *Tracer) SetupTailCalls() {}
 
-func (p *Tracer) Constants() map[string]any {
-	return map[string]any{
-		"g_bpf_debug": p.cfg.EBPF.BpfDebug,
-	}
-}
-
 func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
 
 func (p *Tracer) ProcessBinary(_ *exec.FileInfo) {}
-
-func (p *Tracer) BpfObjects() any {
-	return &p.bpfObjects
-}
 
 func (p *Tracer) AddCloser(c ...io.Closer) {
 	p.closers = append(p.closers, c...)
@@ -128,6 +130,20 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 			Start:    p.bpfObjects.ObiKprobeKsysWrite,
 			Required: true,
 		},
+	}
+
+	hasDoWritev, err := ebpfcommon.KernelHasSymbol(ebpfcommon.KSymDoWritev)
+	if err != nil {
+		p.log.Error("error checking kernel symbol availability", "sym", ebpfcommon.KSymDoWritev, "error", err)
+	}
+
+	if hasDoWritev {
+		m["do_writev"] = ebpfcommon.ProbeDesc{
+			Start:    p.bpfObjects.ObiKprobeDoWritev,
+			Required: false,
+		}
+	} else {
+		p.log.Warn("do_writev kernel symbol not available; writev()-based log writes won't be enriched")
 	}
 
 	hasPipeWrite, err := ebpfcommon.KernelHasSymbol(ebpfcommon.KSymPipeWrite)

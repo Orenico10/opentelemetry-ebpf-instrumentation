@@ -28,13 +28,14 @@ IMG ?= $(IMG_REGISTRY)/$(IMG_ORG)/$(IMG_NAME):$(VERSION)
 
 # The generator is a container image that provides a reproducible environment for
 # building eBPF binaries
-GEN_IMG ?= ghcr.io/open-telemetry/obi-generator:0.2.6
+GEN_IMG ?= ghcr.io/open-telemetry/obi-generator:0.2.9
 
 OCI_BIN ?= docker
 
 # User to run as in docker images.
 DOCKER_USER=$(shell id -u):$(shell id -g)
 DEPENDENCIES_DOCKERFILE=./dependencies.Dockerfile
+GRADLE_IMAGE := $(shell awk '$$4=="gradle-java" {print $$2}' $(DEPENDENCIES_DOCKERFILE))
 
 # BPF code generator dependencies
 CLANG ?= clang
@@ -154,9 +155,27 @@ clang-tidy:
 	cd bpf && find . -type f \( -name '*.c' -o -name '*.h' \) ! -path "./bpfcore/*" ! -path "./NOTICES/*" | xargs clang-tidy
 
 .PHONY: lint
-lint: $(GOLANGCI_LINT) vanity-import-check
+lint: LINT_EXTRA_ARGS =
+lint: lint-run
+
+.PHONY: lint-fix
+lint-fix: LINT_EXTRA_ARGS = --fix
+lint-fix: lint-run
+
+.PHONY: lint-run
+lint-run: $(GOLANGCI_LINT) vanity-import-check lint-dependency-policy
 	@echo "### Linting code"
-	$(GOLANGCI_LINT) run ./... --timeout=6m
+	$(GOLANGCI_LINT) run ./... --timeout=6m $(LINT_EXTRA_ARGS)
+
+.PHONY: lint-dependency-policy
+lint-dependency-policy:
+	@echo "### Linting dependency integrity policy"
+	@if [ -n "$$CI" ]; then \
+		echo "### CI detected: enabling verbose dependency-policy lint logging"; \
+		./scripts/lint-dependency-policy.sh --verbose; \
+	else \
+		./scripts/lint-dependency-policy.sh; \
+	fi
 
 MARKDOWNIMAGE := $(shell awk '$$4=="markdown" {print $$2}' $(DEPENDENCIES_DOCKERFILE))
 WORKDIR := "/go/src/go.opentelemetry.io/obi"
@@ -250,15 +269,19 @@ generate/all: $(BPF2GO)
 .PHONY: docker-generate
 docker-generate:
 	@echo "### Generating files in Docker..."
-	@$(OCI_BIN) run --rm \
-		-u $(DOCKER_USER) \
+	@_git_dir=$$(git rev-parse --absolute-git-dir) && \
+	_git_common_dir=$$(git rev-parse --path-format=absolute --git-common-dir) && \
+	$(OCI_BIN) run --rm \
+		$(if $(findstring podman,$(OCI_BIN)),  ,-u "$(DOCKER_USER)") \
 		-v "$(CURDIR):/src:z" \
+		-v "$$_git_common_dir:/src/.gitrepo:ro,z" \
+		-e GIT_DIR="/src/.gitrepo$${_git_dir#$$_git_common_dir}" \
 		-w /src \
 		$(GEN_IMG) \
 		make generate
 
 .PHONY: verify
-verify: prereqs lint test license-header-check
+verify: prereqs go-mod-tidy lint test license-header-check
 
 .PHONY: build
 build: docker-generate verify compile
@@ -316,37 +339,46 @@ coverage-report-html: cov-exclude-generated
 
 # Java agent targets
 JAVA_AGENT_DIR := pkg/internal/java
+JAVA_AGENT_EMBED_DIR := $(JAVA_AGENT_DIR)/embedded
+JAVA_AGENT_EMBED_PATH := $(JAVA_AGENT_EMBED_DIR)/$(JAVA_AGENT)
+JAVA_AGENT_JAVA_VERSION := $(shell tr -d '[:space:]' < $(JAVA_AGENT_DIR)/.java-version)
+JAVA_AGENT_JAVA_HOME_CANDIDATES := /usr/lib/jvm/java-$(JAVA_AGENT_JAVA_VERSION)-openjdk /usr/lib/jvm/java-$(JAVA_AGENT_JAVA_VERSION)-openjdk-amd64
+JAVA_AGENT_JAVA_HOME_FALLBACK := $(shell ls -d /usr/lib/jvm/java-*-openjdk* 2>/dev/null | sort -V | tail -n 1)
+JAVA_AGENT_JAVA_HOME ?= $(or $(shell for d in $(JAVA_AGENT_JAVA_HOME_CANDIDATES); do [ -d "$$d" ] && { echo "$$d"; break; }; done),$(JAVA_AGENT_JAVA_HOME_FALLBACK))
+JAVA_AGENT_GRADLE_ENV := $(if $(JAVA_AGENT_JAVA_HOME),JAVA_HOME=$(JAVA_AGENT_JAVA_HOME) PATH=$(JAVA_AGENT_JAVA_HOME)/bin:$$PATH,)
 
 .PHONY: java-build
 java-build:
 	@echo "### Building Java agent"
-	cd $(JAVA_AGENT_DIR) && ./gradlew build
-	cp $(JAVA_AGENT_DIR)/build/$(JAVA_AGENT) bin/
+	cd $(JAVA_AGENT_DIR) && $(JAVA_AGENT_GRADLE_ENV) gradle build
+	mkdir -p $(JAVA_AGENT_EMBED_DIR)
+	cp $(JAVA_AGENT_DIR)/build/$(JAVA_AGENT) $(JAVA_AGENT_EMBED_PATH)
 
 .PHONY: java-docker-build
 java-docker-build:
 	@echo "### Building Java agent with Docker"
-	$(OCI_BIN) build --output type=local,dest=./bin --target=export -f javaagent.Dockerfile .
+	mkdir -p $(JAVA_AGENT_EMBED_DIR)
+	$(OCI_BIN) build --output type=local,dest=$(JAVA_AGENT_EMBED_DIR) --target=export -f javaagent.Dockerfile .
 
 .PHONY: java-test
 java-test:
 	@echo "### Testing Java agent"
-	cd $(JAVA_AGENT_DIR) && ./gradlew test
+	cd $(JAVA_AGENT_DIR) && $(JAVA_AGENT_GRADLE_ENV) gradle test
 
 .PHONY: java-spotless-check
 java-spotless-check:
 	@echo "### Checking Java code formatting"
-	cd $(JAVA_AGENT_DIR) && ./gradlew spotlessCheck
+	cd $(JAVA_AGENT_DIR) && $(JAVA_AGENT_GRADLE_ENV) gradle spotlessCheck
 
 .PHONY: java-spotless-apply
 java-spotless-apply:
 	@echo "### Formatting Java code"
-	cd $(JAVA_AGENT_DIR) && ./gradlew spotlessApply
+	cd $(JAVA_AGENT_DIR) && $(JAVA_AGENT_GRADLE_ENV) gradle spotlessApply
 
 .PHONY: java-clean
 java-clean:
 	@echo "### Cleaning Java agent build artifacts"
-	cd $(JAVA_AGENT_DIR) && ./gradlew clean
+	cd $(JAVA_AGENT_DIR) && $(JAVA_AGENT_GRADLE_ENV) gradle clean
 
 .PHONY: java-verify
 java-verify: java-spotless-check java-test java-build
@@ -398,22 +430,35 @@ run-integration-test-vm:
 	@echo "### Running integration tests (pattern: $(TEST_PATTERN))"
 	@TEST_TIMEOUT="60m"; \
 	TEST_PARALLEL="1"; \
-	if [ -f "/precompiled-tests/integration.test" ]; then \
-		echo "Using pre-compiled integration tests"; \
+	if [ -f "/precompiled-tests/integration.test" ] && [ -f "/precompiled-tests/gotestsum" ]; then \
+		echo "Using pre-compiled integration tests with gotestsum"; \
+		chmod +x /precompiled-tests/integration.test /precompiled-tests/gotestsum; \
+		/precompiled-tests/gotestsum \
+			--rerun-fails=2 --rerun-fails-max-failures=2 \
+			--raw-command -ftestname \
+			--jsonfile=testoutput/vm-test-run-$(RUN_NUMBER).log \
+			-- go tool test2json -t -p integration \
+			/precompiled-tests/integration.test \
+			-test.parallel=$$TEST_PARALLEL \
+			-test.timeout=$$TEST_TIMEOUT \
+			-test.v \
+			-test.run="^($(TEST_PATTERN))\$$"; \
+	elif [ -f "/precompiled-tests/integration.test" ]; then \
+		echo "Using pre-compiled integration tests (gotestsum not available)"; \
 		chmod +x /precompiled-tests/integration.test; \
 		/precompiled-tests/integration.test \
 			-test.parallel=$$TEST_PARALLEL \
 			-test.timeout=$$TEST_TIMEOUT \
-			-test.failfast \
 			-test.v \
 			-test.run="^($(TEST_PATTERN))\$$"; \
 	else \
 		echo "Pre-compiled tests not found, compiling in VM"; \
 		$(MAKE) $(GOTESTSUM); \
-		$(GOTESTSUM) -ftestname --jsonfile=testoutput/vm-test-run-$(RUN_NUMBER).log -- \
+		$(GOTESTSUM) \
+			--rerun-fails=2 --rerun-fails-max-failures=2 \
+			-ftestname --jsonfile=testoutput/vm-test-run-$(RUN_NUMBER).log -- \
 			-p $$TEST_PARALLEL \
 			-timeout $$TEST_TIMEOUT \
-			-failfast \
 			-v -a \
 			-run="^($(TEST_PATTERN))\$$" ./internal/test/integration; \
 	fi
@@ -424,12 +469,31 @@ run-integration-test-arm:
 	go clean -testcache
 	go test -p 1 -failfast -v -timeout 90m -a ./internal/test/integration -run "^TestMultiProcess"
 
+.PHONY: unit-test-tools
+unit-test-tools: $(GOTESTSUM) $(ENVTEST)
+
+.PHONY: unit-test-matrix-json
+unit-test-matrix-json: $(GOTESTSUM)
+	@go list ./... | $(GOTESTSUM) tool ci-matrix --partitions $${PARTITIONS:-3} --timing-files=$(TEST_OUTPUT)/unit-test-shard-*.log
+
+.PHONY: run-unit-test-shard
+run-unit-test-shard: $(GOTESTSUM) $(ENVTEST)
+	@echo "### Running unit test shard $(SHARD_ID)"
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
+	$(GOTESTSUM) \
+		--jsonfile=$(TEST_OUTPUT)/unit-test-shard-$(SHARD_ID).log \
+		-- -short -race -a -coverpkg=./... \
+		-coverprofile $(TEST_OUTPUT)/cover-shard-$(SHARD_ID).all.txt \
+		$(UNIT_TEST_PACKAGES)
+
 .PHONY: integration-test-matrix-json
 integration-test-matrix-json:
 	@./scripts/generate-integration-matrix.sh internal/test/integration "$${PARTITIONS:-5}"
 
-.PHONY: vm-integration-test-matrix-json
-vm-integration-test-matrix-json:
+# Shared matrix for workflows that run the TestMultiProcess* suite
+# (VM integration tests and ARM integration tests use the same set of tests).
+.PHONY: multiprocess-integration-test-matrix-json
+multiprocess-integration-test-matrix-json:
 	@./scripts/generate-integration-matrix.sh internal/test/integration "$${PARTITIONS:-5}" "TestMultiProcess"
 
 .PHONY: k8s-integration-test-matrix-json
@@ -467,7 +531,7 @@ itest-coverage-data:
 	# replace the unexpected /src/cmd/obi/main.go file by the module path
 	sed 's/^\/src\/cmd\//github.com\/open-telemetry\/opentelemetry-ebpf-instrumentation\/cmd\//' $(TEST_OUTPUT)/itest-covdata.raw.txt > $(TEST_OUTPUT)/itest-covdata.all.txt
 	# exclude generated files from coverage data
-	grep -vE $(EXCLUDE_COVERAGE_FILES) $(TEST_OUTPUT)/itest-covdata.all.txt > $(TEST_OUTPUT)/itest-covdata.txt
+	grep -vE $(EXCLUDE_COVERAGE_FILES) $(TEST_OUTPUT)/itest-covdata.all.txt > $(TEST_OUTPUT)/itest-covdata.txt || true
 
 .PHONY: oats-prereq
 oats-prereq: $(GINKGO) docker-generate
@@ -498,8 +562,13 @@ oats-test-mongo: oats-prereq
 	mkdir -p internal/test/oats/mongo/$(TEST_OUTPUT)/run
 	cd internal/test/oats/mongo && TESTCASE_TIMEOUT=5m TESTCASE_BASE_PATH=./yaml $(GINKGO) -v -r
 
+.PHONY: oats-test-ai
+oats-test-ai: oats-prereq
+	mkdir -p internal/test/oats/ai/$(TEST_OUTPUT)/run
+	cd internal/test/oats/ai && TESTCASE_TIMEOUT=5m TESTCASE_BASE_PATH=./yaml $(GINKGO) -v -r
+
 .PHONY: oats-test
-oats-test: oats-test-sql oats-test-mongo oats-test-redis oats-test-kafka oats-test-http
+oats-test: oats-test-sql oats-test-mongo oats-test-redis oats-test-kafka oats-test-http oats-test-ai
 	$(MAKE) itest-coverage-data
 
 .PHONY: oats-test-debug
@@ -517,17 +586,15 @@ license-header-check:
 	   fi
 
 .PHONY: artifact
-artifact: docker-generate compile compile-cache java-docker-build
+artifact: docker-generate java-docker-build compile
 	@echo "### Packing generated artifact for $(GOOS)/$(GOARCH)"
 	@STAGING_DIR=$$(mktemp -d 2>/dev/null || mktemp -d -t obi.XXXXXX); \
 	trap "rm -rf $$STAGING_DIR" EXIT; \
 	cp ./bin/$(CMD) $$STAGING_DIR/; \
-	cp ./bin/$(CACHE_CMD) $$STAGING_DIR/; \
-	cp ./bin/$(JAVA_AGENT) $$STAGING_DIR/; \
 	cp LICENSE $$STAGING_DIR/; \
 	cp NOTICE $$STAGING_DIR/; \
 	cp -r NOTICES $$STAGING_DIR/; \
-	tar -C $$STAGING_DIR -czf bin/obi-$(RELEASE_VERSION)-$(GOOS)-$(GOARCH).tar.gz $(CMD) $(CACHE_CMD) $(JAVA_AGENT) LICENSE NOTICE NOTICES
+	tar -C $$STAGING_DIR -czf bin/obi-$(RELEASE_VERSION)-$(GOOS)-$(GOARCH).tar.gz $(CMD) LICENSE NOTICE NOTICES
 
 .PHONY: release
 release: artifact
@@ -538,27 +605,40 @@ release: artifact
 	@mkdir -p $(RELEASE_DIR)/verify-$(GOARCH)
 	@tar -xzf $(RELEASE_DIR)/obi-$(RELEASE_VERSION)-$(GOOS)-$(GOARCH).tar.gz -C $(RELEASE_DIR)/verify-$(GOARCH)
 	@if [ ! -f $(RELEASE_DIR)/verify-$(GOARCH)/$(CMD) ]; then echo "ERROR: $(CMD) binary missing in $(GOARCH) archive"; exit 1; fi
-	@if [ ! -f $(RELEASE_DIR)/verify-$(GOARCH)/$(CACHE_CMD) ]; then echo "ERROR: $(CACHE_CMD) binary missing in $(GOARCH) archive"; exit 1; fi
-	@if [ ! -f $(RELEASE_DIR)/verify-$(GOARCH)/$(JAVA_AGENT) ]; then echo "ERROR: $(JAVA_AGENT) missing in $(GOARCH) archive"; exit 1; fi
 	@if [ ! -f $(RELEASE_DIR)/verify-$(GOARCH)/LICENSE ]; then echo "ERROR: LICENSE missing in $(GOARCH) archive"; exit 1; fi
 	@if [ ! -f $(RELEASE_DIR)/verify-$(GOARCH)/NOTICE ]; then echo "ERROR: NOTICE missing in $(GOARCH) archive"; exit 1; fi
 	@if [ ! -d $(RELEASE_DIR)/verify-$(GOARCH)/NOTICES ]; then echo "ERROR: NOTICES directory missing in $(GOARCH) archive"; exit 1; fi
 	@if [ ! -x $(RELEASE_DIR)/verify-$(GOARCH)/$(CMD) ]; then echo "ERROR: $(CMD) binary not executable in $(GOARCH) archive"; exit 1; fi
-	@if [ ! -x $(RELEASE_DIR)/verify-$(GOARCH)/$(CACHE_CMD) ]; then echo "ERROR: $(CACHE_CMD) binary not executable in $(GOARCH) archive"; exit 1; fi
 	@echo "✓ Archive $(GOARCH) verified successfully"
 	@rm -rf $(RELEASE_DIR)/verify-$(GOARCH)
+	@$(MAKE) release-checksums
+	@echo "### Release artifacts ready in $(RELEASE_DIR)/"
+	@ls -lh $(RELEASE_DIR)/
+
+.PHONY: release-source
+RELEASE_SOURCE_VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || git symbolic-ref --short -q HEAD || echo main)
+release-source: docker-generate java-docker-build
+	@./scripts/release-source.sh --release-version "$(RELEASE_SOURCE_VERSION)" --release-dir "$(RELEASE_DIR)"
+	@$(MAKE) release-checksums RELEASE_VERSION=$(RELEASE_SOURCE_VERSION)
+
+.PHONY: release-checksums
+release-checksums:
 	@echo "### Generating checksums"
-	@if command -v sha256sum >/dev/null 2>&1; then \
-		cd $(RELEASE_DIR) && sha256sum obi-$(RELEASE_VERSION)-$(GOOS)-*.tar.gz > SHA256SUMS; \
+	@mkdir -p $(RELEASE_DIR)
+	@cd $(RELEASE_DIR) && \
+	files=$$(find . -maxdepth 1 -name 'obi-$(RELEASE_VERSION)-*.tar.gz' | sed 's|^\./||' | sort) && \
+	if [ -z "$$files" ]; then \
+		echo "ERROR: No release archives found for obi-$(RELEASE_VERSION)-*.tar.gz in $(RELEASE_DIR)"; \
+		exit 1; \
+	fi && \
+	if command -v sha256sum >/dev/null 2>&1; then \
+		printf '%s\n' "$$files" | xargs sha256sum > SHA256SUMS; \
 	elif command -v shasum >/dev/null 2>&1; then \
-		cd $(RELEASE_DIR) && shasum -a 256 obi-$(RELEASE_VERSION)-$(GOOS)-*.tar.gz > SHA256SUMS; \
+		printf '%s\n' "$$files" | xargs shasum -a 256 > SHA256SUMS; \
 	else \
 		echo "ERROR: Neither sha256sum nor shasum found. Please install coreutils or use macOS builtin shasum."; \
 		exit 1; \
 	fi
-	cd $(RELEASE_DIR) && cp SHA256SUMS SHA256SUMS-$(RELEASE_VERSION)
-	@echo "### Release artifacts ready in $(RELEASE_DIR)/"
-	@ls -lh $(RELEASE_DIR)/
 
 .PHONY: clean-release-dir
 clean-release-dir:
@@ -596,7 +676,26 @@ TARGET_BPF_FILES := $(patsubst ./%,$(NOTICES_DIR)/%,$(BPF_FILES))
 TARGET_BPF := $(TARGET_C_LICENSES) $(TARGET_BPF_FILES)
 
 .PHONY: notices-update
-notices-update: docker-generate go-notices-update $(TARGET_BPF)
+notices-update: docker-generate go-notices-update java-notices-update $(TARGET_BPF)
+
+.PHONY: java-notices-update
+java-notices-update:
+	@echo "### Updating Java dependency notices"
+	@mkdir -p $(NOTICES_DIR)/java/agent
+	@$(OCI_BIN) run --rm \
+		$(if $(findstring podman,$(OCI_BIN)),  ,-u "$(DOCKER_USER)") \
+		-e HOME=/tmp \
+		-e GRADLE_USER_HOME=/tmp/.gradle \
+		-v "$(CURDIR):/src:z" \
+		-w /src/pkg/internal/java \
+		$(GRADLE_IMAGE) \
+		gradle :agent:generateLicenseReport --no-daemon
+	# Normalize the non-deterministic generation timestamp footer to keep
+	# notices-update/check-clean-work-tree stable across CI runs.
+	@awk '{ if ($$0 ~ /^This report was generated at /) print "This report was generated at <normalized>."; else print $$0 }' \
+		pkg/internal/java/agent/build/reports/dependency-license/THIRD_PARTY_LICENSES.txt > \
+		$(NOTICES_DIR)/java/agent/THIRD_PARTY_LICENSES.txt
+	@cp pkg/internal/java/agent/build/reports/dependency-license/THIRD_PARTY_LICENSES.csv $(NOTICES_DIR)/java/agent/
 
 .PHONY: go-notices-update
 go-notices-update: $(GOLICENSES)
@@ -615,10 +714,29 @@ check-clean-work-tree:
 		exit 1; \
 	fi
 
+.PHONY: go-mod-tidy
+GO_MOD_FILES := $(shell find . -type f -name 'go.mod' ! -path './NOTICES/*')
+GO_MOD_TIDY_TARGETS := $(patsubst %/go.mod,%/.go-mod-tidy,$(GO_MOD_FILES))
+GO_MOD_TIDY_117_TARGETS := $(filter %/testserver_1.17/.go-mod-tidy,$(GO_MOD_TIDY_TARGETS))
+GO_MOD_TIDY_DEFAULT_TARGETS := $(filter-out $(GO_MOD_TIDY_117_TARGETS),$(GO_MOD_TIDY_TARGETS))
+.PHONY: $(GO_MOD_TIDY_TARGETS)
+go-mod-tidy: $(GO_MOD_TIDY_TARGETS)
+
+$(GO_MOD_TIDY_DEFAULT_TARGETS):
+	@echo "### Running go mod tidy in $(dir $@)"
+	@cd "$(dir $@)" && go mod tidy
+
+$(GO_MOD_TIDY_117_TARGETS):
+	@echo "### Running go mod tidy -go=1.17 -compat=1.17 in $(dir $@)"
+	@cd "$(dir $@)" && go mod tidy -go=1.17 -compat=1.17
+
 .PHONY: check-go-mod
-check-go-mod:
-	go mod tidy
-	git diff --quiet -- go.mod go.sum
+check-go-mod: go-mod-tidy
+	@if ! git diff --quiet -- ':(glob)**/go.mod' ':(glob)**/go.sum' ':(exclude,glob)NOTICES/**'; then \
+		echo 'go.mod/go.sum files are not clean, did you forget to run "make go-mod-tidy"?'; \
+		git --no-pager diff -- ':(glob)**/go.mod' ':(glob)**/go.sum' ':(exclude,glob)NOTICES/**'; \
+		exit 1; \
+	fi
 
 .PHONY: verify-mods
 verify-mods: $(MULTIMOD)
@@ -657,3 +775,26 @@ vanity-import-fix: $(PORTO)
 regenerate-port-lookup:
 	go run cmd/generate-port-lookup/main.go -dst pkg/internal/netolly/flow/transport/protocol.go
 	$(MAKE) fmt
+
+CONFIG_SCHEMA_FILE ?= docs/config-schema.json
+
+.PHONY: generate-config-schema
+generate-config-schema:
+	@echo "### Generating JSON schema for OBI configuration"
+	@mkdir -p $(dir $(CONFIG_SCHEMA_FILE))
+	go run ./cmd/obi-schema -output $(CONFIG_SCHEMA_FILE)
+
+.PHONY: check-config-schema
+check-config-schema:
+	@echo "### Checking if JSON schema is up-to-date"
+	@mkdir -p $(dir $(CONFIG_SCHEMA_FILE))
+	@go run ./cmd/obi-schema -output $(CONFIG_SCHEMA_FILE).tmp
+	@if ! diff -q $(CONFIG_SCHEMA_FILE) $(CONFIG_SCHEMA_FILE).tmp > /dev/null 2>&1; then \
+		echo "JSON schema is out of date. Run 'make generate-config-schema' to update it."; \
+		echo "Diff:"; \
+		diff $(CONFIG_SCHEMA_FILE) $(CONFIG_SCHEMA_FILE).tmp || true; \
+		rm -f $(CONFIG_SCHEMA_FILE).tmp; \
+		exit 1; \
+	fi
+	@rm -f $(CONFIG_SCHEMA_FILE).tmp
+	@echo "JSON schema is up-to-date"

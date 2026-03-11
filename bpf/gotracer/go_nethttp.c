@@ -27,8 +27,11 @@
 #include <gotracer/go_common.h>
 #include <gotracer/go_offsets.h>
 #include <gotracer/go_str.h>
-#include <gotracer/go_stream_key.h>
-#include <gotracer/hpack.h>
+
+#include <gotracer/maps/nethttp.h>
+
+#include <gotracer/types/nethttp.h>
+#include <gotracer/types/stream_key.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -37,64 +40,6 @@
 #include <maps/tp_char_buf_mem.h>
 
 #include <pid/pid_helpers.h>
-
-static const char traceparent[] = "traceparent: ";
-
-static __always_inline unsigned char *tp_char_buf() {
-    int zero = 0;
-    return bpf_map_lookup_elem(&tp_char_buf_mem, &zero);
-}
-
-typedef struct http_client_data {
-    s64 content_length;
-    pid_info pid;
-    unsigned char path[PATH_MAX_LEN];
-    unsigned char host[HOST_MAX_LEN];
-    unsigned char scheme[SCHEME_MAX_LEN];
-    unsigned char method[METHOD_MAX_LEN];
-    u8 _pad[3];
-} http_client_data_t;
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_addr_key_t); // key: pointer to the request goroutine
-    __type(value, http_client_data_t);
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} ongoing_http_client_requests_data SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_addr_key_t); // key: pointer to the request goroutine
-    __type(value, tp_info_t);
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} http2_server_requests_tp SEC(".maps");
-
-typedef struct server_http_func_invocation {
-    u64 start_monotime_ns;
-    u64 content_length;
-    u64 response_length;
-    u64 status;
-    u64 rpc_request_addr; // pointer to the jsonrpc Request
-    tp_info_t tp;
-    u8 method[METHOD_MAX_LEN];
-    u8 path[PATH_MAX_LEN];
-    u8 pattern[PATTERN_MAX_LEN];
-    u8 _pad[5];
-} server_http_func_invocation_t;
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_addr_key_t); // key: pointer to the request goroutine
-    __type(value, server_http_func_invocation_t);
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} ongoing_http_server_requests SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, u32);
-    __type(value, unsigned char[HTTP_HEADER_MAX_LEN]);
-    __uint(max_entries, 1);
-} temp_header_mem_store SEC(".maps");
 
 static __always_inline unsigned char *temp_header_mem() {
     const u32 zero = 0;
@@ -206,7 +151,7 @@ int obi_uprobe_findHandlerRet(struct pt_regs *ctx) {
     bpf_dbg_printk("goroutine_addr=%lx, invocation=%llx", goroutine_addr, invocation);
 
     if (invocation) {
-        u64 len = (u64)GO_PARAM4(ctx);
+        const u64 len = (u64)GO_PARAM4(ctx);
         void *ptr = GO_PARAM3(ctx);
         if (ptr) {
             bpf_dbg_printk("reading pattern information with len: %d", len);
@@ -236,7 +181,7 @@ int obi_uprobe_muxSetMatch(struct pt_regs *ctx) {
         void *path = GO_PARAM2(ctx);
         if (path) {
             bpf_dbg_printk("reading template from path: %llx", path);
-            u64 templ_off = go_offset_of(ot, (go_offset){.v = _mux_template_pos});
+            const u64 templ_off = go_offset_of(ot, (go_offset){.v = _mux_template_pos});
             read_go_str("pattern", path, templ_off, invocation->pattern, PATTERN_MAX_LEN);
             bpf_dbg_printk("pattern=%s", invocation->pattern);
         }
@@ -257,7 +202,7 @@ int obi_uprobe_ginGetValueRet(struct pt_regs *ctx) {
         bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
 
     off_table_t *ot = get_offsets_table();
-    u64 fullpath_off = go_offset_of(ot, (go_offset){.v = _gin_fullpath_pos});
+    const u64 fullpath_off = go_offset_of(ot, (go_offset){.v = _gin_fullpath_pos});
 
     bpf_dbg_printk("goroutine_addr=%lx, invocation=%llx, fullpath_off=%d",
                    goroutine_addr,
@@ -272,7 +217,7 @@ int obi_uprobe_ginGetValueRet(struct pt_regs *ctx) {
                 // registers
                 if (fullpath_off == _gin_fullpath_off_pre_17) {
                     void *ptr = GO_PARAM8(ctx);
-                    u64 len = (u64)GO_PARAM9(ctx);
+                    const u64 len = (u64)GO_PARAM9(ctx);
 
                     if (ptr) {
                         bpf_dbg_printk("pre gin 1.7.0 fullPath from: %llx", ptr);
@@ -281,7 +226,7 @@ int obi_uprobe_ginGetValueRet(struct pt_regs *ctx) {
                     }
                 } else {
                     void *ptr = GO_PARAM6(ctx);
-                    u64 len = (u64)GO_PARAM7(ctx);
+                    const u64 len = (u64)GO_PARAM7(ctx);
 
                     if (ptr) {
                         bpf_dbg_printk("post gin 1.7.0 fullPath from: %llx", ptr);
@@ -309,7 +254,9 @@ int obi_uprobe_readRequestStart(struct pt_regs *ctx) {
 
     connection_info_t *existing = bpf_map_lookup_elem(&ongoing_server_connections, &g_key);
 
-    if (!existing) {
+    // Populate connection info if: no entry exists yet, OR the entry was created by connServe
+    // with zeroed ports
+    if (!existing || (existing->d_port == 0 && existing->s_port == 0)) {
         void *c_ptr = GO_PARAM1(ctx);
         if (c_ptr) {
             void *conn_conn_ptr =
@@ -474,7 +421,7 @@ int obi_uprobe_readMimeHeader(struct pt_regs *ctx) {
 
     server_http_func_invocation_t *inv = bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
 
-    unsigned char *buf = tp_char_buf();
+    unsigned char *buf = (unsigned char *)tp_char_buf_mem();
     if (!buf) {
         return 0;
     }
@@ -511,7 +458,7 @@ int obi_uprobe_readContinuedLineSliceReturns(struct pt_regs *ctx) {
         return 0;
     }
 
-    u64 len = (u64)GO_PARAM2(ctx);
+    const u64 len = (u64)GO_PARAM2(ctx);
     const unsigned char *buf = (const unsigned char *)GO_PARAM1(ctx);
 
     unsigned char *temp = temp_header_mem();
@@ -632,13 +579,6 @@ int obi_uprobe_ServeHTTPReturns(struct pt_regs *ctx) {
     bpf_dbg_printk("=== uprobe/ServeHTTP_ret ===");
     return serve_http_returns(ctx);
 }
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, void *); // key: pointer to the request header map
-    __type(value, u64);  // the goroutine of the transport request
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} header_req_map SEC(".maps");
 
 /* HTTP Client. We expect to see HTTP client in both HTTP server and gRPC server calls.*/
 static __always_inline void roundTripStartHelper(struct pt_regs *ctx) {
@@ -807,7 +747,7 @@ int obi_uprobe_roundTripReturn(struct pt_regs *ctx) {
     bpf_dbg_printk("method=%s", trace->method);
     bpf_dbg_printk("path=%s", trace->path);
 
-    u64 status_code_ptr_pos = go_offset_of(ot, (go_offset){.v = _status_code_ptr_pos});
+    const u64 status_code_ptr_pos = go_offset_of(ot, (go_offset){.v = _status_code_ptr_pos});
     bpf_probe_read(&trace->status, sizeof(trace->status), (void *)(resp_ptr + status_code_ptr_pos));
 
     bpf_dbg_printk("status=%d, status_code_ptr_pos=%d, resp_ptr=%lx",
@@ -815,7 +755,8 @@ int obi_uprobe_roundTripReturn(struct pt_regs *ctx) {
                    status_code_ptr_pos,
                    (u64)resp_ptr);
 
-    u64 response_length_ptr_pos = go_offset_of(ot, (go_offset){.v = _response_length_ptr_pos});
+    const u64 response_length_ptr_pos =
+        go_offset_of(ot, (go_offset){.v = _response_length_ptr_pos});
     bpf_probe_read(&trace->response_length,
                    sizeof(trace->response_length),
                    (void *)(resp_ptr + response_length_ptr_pos));
@@ -879,8 +820,8 @@ int obi_uprobe_writeSubset(struct pt_regs *ctx) {
     make_tp_string(buf, &func_inv->tp);
 
     void *buf_ptr = 0;
-    u64 io_writer_buf_ptr_pos = go_offset_of(ot, (go_offset){.v = _io_writer_buf_ptr_pos});
-    u64 io_writer_n_pos = go_offset_of(ot, (go_offset){.v = _io_writer_n_pos});
+    const u64 io_writer_buf_ptr_pos = go_offset_of(ot, (go_offset){.v = _io_writer_buf_ptr_pos});
+    const u64 io_writer_n_pos = go_offset_of(ot, (go_offset){.v = _io_writer_n_pos});
 
     // writing with bad offsets can crash the application, be defensive here
     if (!io_writer_buf_ptr_pos || !io_writer_n_pos) {
@@ -946,7 +887,7 @@ int obi_uprobe_http2ResponseWriterStateWriteHeader(struct pt_regs *ctx) {
     bpf_dbg_printk("=== uprobe/http2ResponseWriterStateWriteHeader ===");
 
     void *goroutine_addr = GOROUTINE_PTR(ctx);
-    u64 status = (u64)GO_PARAM2(ctx);
+    const u64 status = (u64)GO_PARAM2(ctx);
     bpf_dbg_printk("goroutine_addr=%lx, status=%d", goroutine_addr, status);
     go_addr_key_t g_key = {};
     go_addr_key_from_id(&g_key, goroutine_addr);
@@ -1028,15 +969,6 @@ int obi_uprobe_http2serverConn_runHandler(struct pt_regs *ctx) {
     return 0;
 }
 
-// HTTP 2.0 client support
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, stream_key_t); // key: stream id + connection info
-    // the goroutine of the round trip request, which is the key for our traceparent info
-    __type(value, u64);
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} http2_req_map SEC(".maps");
-
 static __always_inline void setup_http2_client_conn(void *goroutine_addr,
                                                     void *cc_ptr,
                                                     u32 stream_id,
@@ -1058,7 +990,7 @@ static __always_inline void setup_http2_client_conn(void *goroutine_addr,
     off_table_t *ot = get_offsets_table();
 
     if (cc_ptr) {
-        u64 cc_tconn_pos = go_offset_of(ot, (go_offset){.v = off_cc_tconn_pos});
+        const u64 cc_tconn_pos = go_offset_of(ot, (go_offset){.v = off_cc_tconn_pos});
         bpf_dbg_printk("cc_ptr=%llx, cc_tconn_ptr=%llx", cc_ptr, cc_ptr + cc_tconn_pos);
         void *tconn = cc_ptr + go_offset_of(ot, (go_offset){.v = off_cc_tconn_pos});
         bpf_probe_read(&tconn, sizeof(tconn), (void *)(cc_ptr + cc_tconn_pos + 8));
@@ -1070,7 +1002,7 @@ static __always_inline void setup_http2_client_conn(void *goroutine_addr,
             bpf_dbg_printk("tconn_conn=%llx", tconn_conn);
 
             connection_info_t conn = {0};
-            u8 ok = get_conn_info(tconn_conn, &conn);
+            const u8 ok = get_conn_info(tconn_conn, &conn);
 
             if (ok) {
                 bpf_dbg_printk("goroutine_addr=%lx", goroutine_addr);
@@ -1115,7 +1047,7 @@ SEC("uprobe/http2WriteHeaders")
 int obi_uprobe_http2WriteHeaders(struct pt_regs *ctx) {
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     void *cc_ptr = GO_PARAM1(ctx);
-    u64 stream_id = (u64)GO_PARAM2(ctx);
+    const u64 stream_id = (u64)GO_PARAM2(ctx);
 
     bpf_dbg_printk("=== uprobe/http2WriteHeaders ===");
 
@@ -1131,7 +1063,7 @@ SEC("uprobe/http2WriteHeadersVendored")
 int obi_uprobe_http2WriteHeaders_vendored(struct pt_regs *ctx) {
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     void *cc_ptr = GO_PARAM1(ctx);
-    u64 stream_id = (u64)GO_PARAM2(ctx);
+    const u64 stream_id = (u64)GO_PARAM2(ctx);
 
     bpf_dbg_printk("=== uprobe/http2WriteHeadersVendored ===");
 
@@ -1140,23 +1072,6 @@ int obi_uprobe_http2WriteHeaders_vendored(struct pt_regs *ctx) {
 
     return 0;
 }
-
-#define MAX_W_PTR_N 1024
-
-typedef struct framer_func_invocation {
-    u64 framer_ptr;
-    tp_info_t tp;
-    s64 initial_n;
-} framer_func_invocation_t;
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_addr_key_t); // key: go routine doing framer write headers
-    __type(
-        value,
-        framer_func_invocation_t); // the goroutine of the round trip request, which is the key for our traceparent info
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} framer_invocation_map SEC(".maps");
 
 static __always_inline void
 on_http2FramerWriteHeaders(struct pt_regs *ctx, off_table_t *ot, u64 stream_id) {
@@ -1171,7 +1086,7 @@ on_http2FramerWriteHeaders(struct pt_regs *ctx, off_table_t *ot, u64 stream_id) 
         return;
     }
 
-    u64 framer_w_pos = go_offset_of(ot, (go_offset){.v = _framer_w_pos});
+    const u64 framer_w_pos = go_offset_of(ot, (go_offset){.v = _framer_w_pos});
 
     if (framer_w_pos == -1) {
         bpf_dbg_printk("framer w not found");
@@ -1269,9 +1184,6 @@ int obi_uprobe_net_http2FramerWriteHeaders(struct pt_regs *ctx) {
     return 0;
 }
 
-#define HTTP2_ENCODED_HEADER_LEN                                                                   \
-    66 // 1 + 1 + 8 + 1 + 55 = type byte + hpack_len_as_byte("traceparent") + strlen(hpack("traceparent")) + len_as_byte(55) + generated traceparent id
-
 SEC("uprobe/http2FramerWriteHeaders_returns")
 int obi_uprobe_http2FramerWriteHeaders_returns(struct pt_regs *ctx) {
     if (!g_bpf_header_propagation) {
@@ -1289,8 +1201,8 @@ int obi_uprobe_http2FramerWriteHeaders_returns(struct pt_regs *ctx) {
 
     if (f_info) {
         void *w_ptr = 0;
-        u64 framer_w_pos = go_offset_of(ot, (go_offset){.v = _framer_w_pos});
-        u64 io_writer_n_pos = go_offset_of(ot, (go_offset){.v = _io_writer_n_pos});
+        const u64 framer_w_pos = go_offset_of(ot, (go_offset){.v = _framer_w_pos});
+        const u64 io_writer_n_pos = go_offset_of(ot, (go_offset){.v = _io_writer_n_pos});
 
         // being defensive here if we can't find the offsets
         if (!framer_w_pos || !io_writer_n_pos) {
@@ -1340,12 +1252,12 @@ int obi_uprobe_http2FramerWriteHeaders_returns(struct pt_regs *ctx) {
 
                 bpf_dbg_printk("sizes: 1=%x, 2=%x, 3=%x", size_1, size_2, size_3);
 
-                u32 original_size = ((u32)(size_1) << 16) | ((u32)(size_2) << 8) | size_3;
+                const u32 original_size = ((u32)(size_1) << 16) | ((u32)(size_2) << 8) | size_3;
                 if (original_size > 0) {
                     u8 type_byte = 0;
-                    u8 key_len =
-                        TP_ENCODED_LEN | 0x80; // high tagged to signify hpack encoded value
-                    u8 val_len = TP_MAX_VAL_LENGTH;
+                    const u8 key_len =
+                        sizeof(tp_encoded) | 0x80; // high tagged to signify hpack encoded value
+                    const u8 val_len = TP_MAX_VAL_LENGTH;
 
                     // We don't hpack encode the value of the traceparent field, because that will require that
                     // we use bpf_loop, which in turn increases the kernel requirement to 5.17+.
@@ -1360,7 +1272,7 @@ int obi_uprobe_http2FramerWriteHeaders_returns(struct pt_regs *ctx) {
                     // Write 'traceparent' encoded as hpack
                     bpf_probe_write_user(buf_arr + (n & 0x0ffff), tp_encoded, sizeof(tp_encoded));
                     ;
-                    n += TP_ENCODED_LEN;
+                    n += sizeof(tp_encoded);
                     // Write the length of the hpack encoded traceparent field
                     bpf_probe_write_user(buf_arr + (n & 0x0ffff), &val_len, sizeof(val_len));
                     n++;
@@ -1369,7 +1281,7 @@ int obi_uprobe_http2FramerWriteHeaders_returns(struct pt_regs *ctx) {
                     // Update the value of n in w to reflect the new size
                     bpf_probe_write_user((void *)(w_ptr + io_writer_n_pos), &n, sizeof(n));
 
-                    u32 new_size = original_size + HTTP2_ENCODED_HEADER_LEN;
+                    const u32 new_size = original_size + HTTP2_ENCODED_HEADER_LEN;
 
                     bpf_dbg_printk("Changing size from %d to %d", original_size, new_size);
                     size_1 = (u8)(new_size >> 16);
@@ -1526,8 +1438,8 @@ int obi_uprobe_persistConnRoundTrip(struct pt_regs *ctx) {
                 get_conn_info(
                     conn_ptr,
                     &conn); // initialized to 0, no need to check the result if we succeeded
-                u64 pid_tid = bpf_get_current_pid_tgid();
-                u32 pid = pid_from_pid_tgid(pid_tid);
+                const u64 pid_tid = bpf_get_current_pid_tgid();
+                const u32 pid = pid_from_pid_tgid(pid_tid);
                 tp_info_pid_t tp_p = {
                     .pid = pid,
                     .valid = 1,

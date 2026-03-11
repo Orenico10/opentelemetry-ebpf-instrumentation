@@ -11,7 +11,7 @@ import (
 
 // AttrGroups will let enabling by default some groups of attributes under
 // given circumstances. For example, will let enabling kubernetes metadata attributes
-// only if Beyla is running under Kubernetes and kube metadata is enabled.
+// only if OBI is running under Kubernetes and kube metadata is enabled.
 type AttrGroups int
 
 const (
@@ -191,7 +191,7 @@ func getDefinitions(
 
 	// ServiceName and ServiceNamespace are reported both as resource and metric attributes, as
 	// the OTEL definition requires that it is reported as resource attribute,
-	// but Grafana Cloud takes it from the metric
+	// but Cloud providers may extract this from the metric
 	appAttributes := NewAttrReportGroup(
 		false,
 		[]*AttrReportGroup{
@@ -325,7 +325,11 @@ func getDefinitions(
 		},
 		Traces.Section: {
 			Attributes: map[attr.Name]Default{
-				attr.DBQueryText: false,
+				attr.DBQueryText:       false,
+				attr.GenAIInput:        false,
+				attr.GenAIOutput:       false,
+				attr.GenAIInstructions: false,
+				attr.GenAIMetadata:     false,
 			},
 		},
 		GPUCudaKernelLaunchCalls.Section: {

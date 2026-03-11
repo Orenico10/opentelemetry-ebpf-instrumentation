@@ -10,14 +10,20 @@
 
 #include <common/connection_info.h>
 #include <common/protocol_defs.h>
+#include <common/runtime.h>
+#include <common/tracing.h>
+#include <maps/java_tasks.h>
 
 #include <generictracer/k_tracer_defs.h>
-#include <generictracer/maps/java_tasks.h>
 #include <generictracer/maps/pid_tid_to_conn.h>
 
 #include <logger/bpf_dbg.h>
 
+#include <maps/server_traces.h>
+
 #include <pid/pid.h>
+
+#include <shared/obi_ctx.h>
 
 enum { k_ioctl_magic_id = 0x0b10b1 };
 enum {
@@ -42,7 +48,7 @@ static __always_inline u8 cmd_to_op(u8 cmd) {
 SEC("kprobe/sys_ioctl")
 // unsigned int fd, unsigned int cmd, void *arg
 int BPF_KPROBE(obi_kprobe_sys_ioctl) {
-    u64 id = bpf_get_current_pid_tgid();
+    const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
         return 0;
@@ -87,7 +93,7 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
         pid_key_t child = {0};
         task_tid(&child);
         pid_key_t parent = child;
-        u32 parent_tid = tid_from_pid_tgid(parent_id);
+        const u32 parent_tid = tid_from_pid_tgid(parent_id);
         parent.tid = parent_tid;
 
         if (parent.tid == child.tid) {
@@ -97,10 +103,22 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
 
         bpf_dbg_printk("Java thread mapping [%d] -> [%d]", parent.tid, child.tid);
         bpf_map_update_elem(&java_tasks, &child, &parent, BPF_ANY);
+
+        // Walk the java_tasks chain to find the parent's server trace and
+        // refresh traces_ctx_v1 for this child thread.
+        trace_key_t t_key = {.p_key = parent, .extra_id = extra_runtime_id_with_task_id(parent_id)};
+        tp_info_pid_t *server_tp = find_parent_java_trace(&t_key);
+
+        if (server_tp && server_tp->valid) {
+            obi_ctx__set(id, &server_tp->tp);
+        } else {
+            obi_ctx__del(id);
+        }
+
         return 0;
     }
 
-    u8 op = cmd_to_op(op_cmd);
+    const u8 op = cmd_to_op(op_cmd);
 
     if (op == k_ioctl_invalid_op) {
         bpf_dbg_printk("unknown cmd=%d", op_cmd);
@@ -140,6 +158,8 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
 
     if (len > 0) {
         void *buf = arg + 1 + sizeof(connection_info_t) + sizeof(u32);
+        const u64 zero = 0;
+        bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_ANY);
         handle_buf_with_connection(ctx, &p_conn, buf, len, WITH_SSL, op, orig_dport);
     }
 

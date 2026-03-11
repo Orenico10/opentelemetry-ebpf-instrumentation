@@ -23,12 +23,13 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/config"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/ringbuf"
+	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 )
 
 func TestTCPReqSQLParsing(t *testing.T) {
 	sql := randomStringWithSub("SELECT * FROM accounts ")
 	r := makeTCPReq(sql, 343534)
-	op, table, sql := detectSQL(sql)
+	op, table, sql := detectSQL([]byte(sql))
 	assert.Equal(t, "SELECT", op)
 	assert.Equal(t, "accounts", table)
 	s := TCPToSQLToSpan(&r, op, table, sql, request.DBGeneric, "", nil)
@@ -46,7 +47,7 @@ func TestTCPReqSQLParsing(t *testing.T) {
 func TestTCPReqParsing(t *testing.T) {
 	sql := "Not a sql or any known protocol"
 	r := makeTCPReq(sql, 343534)
-	op, table, _ := detectSQL(sql)
+	op, table, _ := detectSQL([]byte(sql))
 	assert.Empty(t, op)
 	assert.Empty(t, table)
 	assert.NotNil(t, r)
@@ -86,8 +87,13 @@ func TestTCPReqParsing(t *testing.T) {
 }
 
 func TestSQLDetection(t *testing.T) {
-	for _, s := range []string{"SELECT * from accounts", "SELECT/*My comment*/ * from accounts", "--UPDATE accounts SET", "DELETE++ from accounts ", "INSERT into accounts ", "CREATE table accounts ", "DROP table accounts ", "ALTER table accounts"} {
-		surrounded := randomStringWithSub(s)
+	for _, s := range [][]byte{
+		[]byte("SELECT * from accounts"), []byte("SELECT/*My comment*/ * from accounts"),
+		[]byte("--UPDATE accounts SET"), []byte("DELETE++ from accounts "),
+		[]byte("INSERT into accounts "), []byte("CREATE table accounts "),
+		[]byte("DROP table accounts "), []byte("ALTER table accounts"),
+	} {
+		surrounded := []byte(randomStringWithSub(string(s)))
 		op, table, _ := detectSQL(s)
 		assert.NotEmpty(t, op)
 		assert.NotEmpty(t, table)
@@ -98,17 +104,19 @@ func TestSQLDetection(t *testing.T) {
 }
 
 func TestSQLDetectionFails(t *testing.T) {
-	for _, s := range []string{"SELECT", "UPDATES{}", "DELETE {} ", "INSERT// into accounts "} {
+	for _, s := range [][]byte{
+		[]byte("SELECT"), []byte("UPDATES{}"), []byte("DELETE {} "), []byte("INSERT// into accounts "),
+	} {
 		op, table, _ := detectSQL(s)
 		assert.False(t, validSQL(op, table, request.DBGeneric))
-		surrounded := randomStringWithSub(s)
+		surrounded := []byte(randomStringWithSub(string(s)))
 		op, table, _ = detectSQL(surrounded)
 		assert.False(t, validSQL(op, table, request.DBGeneric))
 	}
 }
 
 func TestSQLDetectionDoesntFailForDetectedKind(t *testing.T) {
-	for _, s := range []string{"SELECT", "DELETE {} "} {
+	for _, s := range [][]byte{[]byte("SELECT"), []byte("DELETE {} ")} {
 		op, table, _ := detectSQL(s)
 		assert.True(t, validSQL(op, table, request.DBPostgres))
 	}
@@ -168,7 +176,7 @@ func TestRedisDetection(t *testing.T) {
 	} {
 		lines := strings.Split(s, "|")
 		test := strings.Join(lines, "\r\n")
-		assert.True(t, isRedis([]uint8(test)))
+		assert.True(t, isRedis(largebuf.NewLargeBufferFrom([]uint8(test))))
 		assert.True(t, isRedisOp([]uint8(test)))
 	}
 
@@ -182,7 +190,7 @@ func TestRedisDetection(t *testing.T) {
 	} {
 		lines := strings.Split(s, "|")
 		test := strings.Join(lines, "\r\n")
-		assert.False(t, isRedis([]uint8(test)))
+		assert.False(t, isRedis(largebuf.NewLargeBufferFrom([]uint8(test))))
 		assert.False(t, isRedisOp([]uint8(test)))
 	}
 }
@@ -191,7 +199,7 @@ func TestTCPReqKafkaParsing(t *testing.T) {
 	// kafka message
 	b := []byte{0, 0, 0, 94, 0, 1, 0, 11, 0, 0, 0, 224, 0, 6, 115, 97, 114, 97, 109, 97, 255, 255, 255, 255, 0, 0, 1, 244, 0, 0, 0, 1, 6, 64, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 1, 0, 9, 105, 109, 112, 111, 114, 116, 97, 110, 116, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0}
 	r := makeTCPReq(string(b), 343534)
-	k, _, err := ProcessKafkaRequest(b, nil)
+	k, _, err := ProcessKafkaRequest(largebuf.NewLargeBufferFrom(b), nil)
 	require.NoError(t, err)
 	s := TCPToKafkaToSpan(&r, k)
 	assert.NotNil(t, s)
@@ -240,7 +248,7 @@ func TestTCPReqMQTTHeuristicFailure(t *testing.T) {
 	}
 
 	// Verify the heuristic passes but full parsing fails
-	assert.True(t, isMQTT(b), "packet should pass isMQTT heuristic")
+	assert.True(t, isMQTT(largebuf.NewLargeBufferFrom(b)), "packet should pass isMQTT heuristic")
 	_, _, err := ProcessMQTTEvent(b)
 	require.Error(t, err, "full MQTT parsing should fail")
 
@@ -271,6 +279,134 @@ func randomString(length int) string {
 
 func randomStringWithSub(sub string) string {
 	return fmt.Sprintf("%s%s%s", randomString(rand.IntN(10)), sub, randomString(rand.IntN(20)))
+}
+
+func TestReadTCPRequestIntoSpan_CouchbaseKeyNotFound(t *testing.T) {
+	// Real Couchbase memcached binary protocol packets captured from eBPF
+	// Request: GET for key "non_existent_document_xyz_123" (with collection ID prefix byte)
+	// Original response used flexible framing (magic 0x18) which isn't fully supported,
+	// so we construct an equivalent standard response (magic 0x81) with KEY_NOT_FOUND status
+	requestBuffer := []byte{128, 0, 0, 30, 0, 0, 0, 70, 0, 0, 0, 30, 0, 0, 92, 240, 0, 0, 0, 0, 0, 0, 0, 0, 0, 110, 111, 110, 95, 101, 120, 105, 115, 116, 101, 110, 116, 95, 100, 111, 99, 117, 109, 101, 110, 116, 95, 120, 121, 122, 95, 49, 50, 51}
+
+	// Construct a standard response packet (magic 0x81) with KEY_NOT_FOUND status (0x0001)
+	// Header format: magic(1) + opcode(1) + keyLen(2) + extrasLen(1) + dataType(1) + status(2) + bodyLen(4) + opaque(4) + CAS(8) = 24 bytes
+	responseBuffer := []byte{
+		0x81,       // Magic: MagicClientResponse
+		0x00,       // Opcode: GET
+		0x00, 0x00, // Key length: 0
+		0x00,       // Extras length: 0
+		0x00,       // Data type: raw
+		0x00, 0x01, // Status: KEY_NOT_FOUND (1)
+		0x00, 0x00, 0x00, 0x00, // Body length: 0
+		0x00, 0x00, 0x5c, 0xf0, // Opaque: 23792 (same as request)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // CAS: 0
+	}
+
+	// Create TCPRequestInfo with the captured buffers
+	tri := TCPRequestInfo{
+		StartMonotimeNs: 1000000000,
+		EndMonotimeNs:   1000500000,
+		Len:             uint32(len(requestBuffer)),
+		RespLen:         uint32(len(responseBuffer)),
+		Direction:       directionSend,
+	}
+
+	copy(tri.Buf[:], requestBuffer)
+	copy(tri.Rbuf[:], responseBuffer)
+
+	// Set up connection info (client -> Couchbase server on port 11210)
+	tri.ConnInfo.S_addr = [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 0, 1}
+	tri.ConnInfo.D_addr = [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1}
+	tri.ConnInfo.S_port = 54321
+	tri.ConnInfo.D_port = 11210
+
+	// Set PID info
+	tri.Pid.HostPid = 1234
+	tri.Pid.UserPid = 1234
+	tri.Pid.Ns = 4026531840
+
+	cfg := config.EBPFTracer{HeuristicSQLDetect: false}
+	ctx := NewEBPFParseContext(&cfg, nil, nil)
+
+	binaryRecord := bytes.Buffer{}
+	require.NoError(t, binary.Write(&binaryRecord, binary.LittleEndian, tri))
+
+	fltr := TestPidsFilter{services: map[app.PID]svc.Attrs{}}
+
+	span, ignore, err := ReadTCPRequestIntoSpan(ctx, &cfg, &ringbuf.Record{RawSample: binaryRecord.Bytes()}, &fltr)
+	require.NoError(t, err)
+	assert.False(t, ignore, "Couchbase event should not be ignored")
+
+	// Verify the span is correctly identified as a Couchbase event
+	assert.Equal(t, request.EventTypeCouchbaseClient, span.Type)
+	assert.Equal(t, "GET", span.Method)
+
+	assert.Equal(t, 1, span.Status, "Status should be 1 (KeyNotFound)")
+	assert.NotEmpty(t, span.DBError.ErrorCode, "DBError.ErrorCode should be set for KeyNotFound")
+	assert.Equal(t, "1", span.DBError.ErrorCode, "DBError.ErrorCode should be 1 (KeyNotFound)")
+	assert.NotEmpty(t, span.DBError.Description, "DBError.Description should be set for KeyNotFound")
+	assert.Equal(t, "KeyNotFound", span.DBError.Description, "DBError.Description should indicate KeyNotFound")
+}
+
+func TestReadTCPRequestIntoSpan_CouchbaseFlexibleFraming(t *testing.T) {
+	// Real Couchbase memcached binary protocol packets captured from eBPF
+	// Request: GET for key with collection ID prefix
+	// Response: Uses flexible framing (magic 0x18) with KEY_NOT_FOUND status
+	//
+	// Original captured buffers:
+	// [>] [128 0 0 30 0 0 0 70 0 0 0 30 0 0 92 240 0 0 0 0 0 0 0 0 0 110 111 110 95 101 120 105 115 116 101 110 116 95 100 111 99 117 109 101 110 116 95 120 121 122 95 49 50 51]
+	// [<] [24 0 3 0 0 0 0 1 0 0 0 3 0 0 92 240 0 0 0 0 0 0 0 0 2 0 15]
+	//
+	// The response uses MagicAltClientResponse (0x18) which has a different header layout:
+	// - byte 2: framing extras length (not part of key length)
+	// - byte 3: key length (single byte)
+	// Currently the parser doesn't fully support flexible framing, so the status may not be extracted correctly.
+	requestBuffer := []byte{128, 0, 0, 30, 0, 0, 0, 70, 0, 0, 0, 30, 0, 0, 92, 240, 0, 0, 0, 0, 0, 0, 0, 0, 0, 110, 111, 110, 95, 101, 120, 105, 115, 116, 101, 110, 116, 95, 100, 111, 99, 117, 109, 101, 110, 116, 95, 120, 121, 122, 95, 49, 50, 51}
+	responseBuffer := []byte{24, 0, 3, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 92, 240, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 15}
+
+	// Create TCPRequestInfo with the captured buffers
+	tri := TCPRequestInfo{
+		StartMonotimeNs: 1000000000,
+		EndMonotimeNs:   1000500000,
+		Len:             uint32(len(requestBuffer)),
+		RespLen:         uint32(len(responseBuffer)),
+		Direction:       directionSend,
+	}
+
+	copy(tri.Buf[:], requestBuffer)
+	copy(tri.Rbuf[:], responseBuffer)
+
+	// Set up connection info (client -> Couchbase server on port 11210)
+	tri.ConnInfo.S_addr = [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 0, 1}
+	tri.ConnInfo.D_addr = [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1}
+	tri.ConnInfo.S_port = 54321
+	tri.ConnInfo.D_port = 11210
+
+	// Set PID info
+	tri.Pid.HostPid = 1234
+	tri.Pid.UserPid = 1234
+	tri.Pid.Ns = 4026531840
+
+	cfg := config.EBPFTracer{HeuristicSQLDetect: false}
+	ctx := NewEBPFParseContext(&cfg, nil, nil)
+
+	binaryRecord := bytes.Buffer{}
+	require.NoError(t, binary.Write(&binaryRecord, binary.LittleEndian, tri))
+
+	fltr := TestPidsFilter{services: map[app.PID]svc.Attrs{}}
+
+	span, ignore, err := ReadTCPRequestIntoSpan(ctx, &cfg, &ringbuf.Record{RawSample: binaryRecord.Bytes()}, &fltr)
+	require.NoError(t, err)
+	assert.False(t, ignore, "Couchbase event should not be ignored")
+
+	// Verify the span is correctly identified as a Couchbase event
+	assert.Equal(t, request.EventTypeCouchbaseClient, span.Type)
+	assert.Equal(t, "GET", span.Method)
+
+	assert.NotEmpty(t, span.DBError.ErrorCode, "DBError.ErrorCode should be set for KeyNotFound")
+	assert.Equal(t, "1", span.DBError.ErrorCode, "DBError.ErrorCode should be 1 (KeyNotFound)")
+	assert.NotEmpty(t, span.DBError.Description, "DBError.Description should be set for KeyNotFound")
+	assert.Equal(t, "KeyNotFound", span.DBError.Description, "DBError.Description should indicate KeyNotFound")
 }
 
 func makeTCPReq(buf string, peerPort uint32) TCPRequestInfo {

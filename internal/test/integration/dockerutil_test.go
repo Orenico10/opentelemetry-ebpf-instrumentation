@@ -5,6 +5,7 @@ package integration
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,7 +13,16 @@ import (
 
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"github.com/ory/dockertest/v3/docker/opts"
 	"github.com/stretchr/testify/require"
+)
+
+const (
+	versionPrometheus  = "v2.55.1"
+	versionJaeger      = "1.60"
+	versionCollector   = "0.144.0"
+	versionAWSMetaMock = "v1.9.2"
+	versionNginx       = "1.29.5"
 )
 
 // setupDockerNetwork initializes a custom network for the test.
@@ -30,13 +40,13 @@ func setupDockerNetwork(t *testing.T) *dockertest.Network {
 }
 
 // setupContainerPrometheus starts a Prometheus container for metrics scraping.
-func setupContainerPrometheus(t *testing.T, network *dockertest.Network, configFile string) { //nolint:unparam // configFile is always passed in current usages but may vary in future
+func setupContainerPrometheus(t *testing.T, network *dockertest.Network, configFile string) {
 	t.Helper()
 
 	t.Log("Starting Prometheus container...")
 	prometheus, err := dockerPool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "quay.io/prometheus/prometheus",
-		Tag:        "v2.55.1",
+		Tag:        versionPrometheus,
 		Name:       fmt.Sprintf("prometheus-otel-test-%d", time.Now().UnixNano()),
 		Networks:   []*dockertest.Network{network},
 		Mounts: []string{
@@ -66,7 +76,7 @@ func setupContainerJaeger(t *testing.T, network *dockertest.Network) {
 	t.Log("Starting Jaeger container...")
 	jaeger, err := dockerPool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "jaegertracing/all-in-one",
-		Tag:        "1.60",
+		Tag:        versionJaeger,
 		Name:       fmt.Sprintf("jaeger-otel-test-%d", time.Now().UnixNano()),
 		Env: []string{
 			"COLLECTOR_OTLP_ENABLED=true",
@@ -100,7 +110,7 @@ func setupContainerCollector(t *testing.T, network *dockertest.Network, configFi
 	t.Log("Starting OpenTelemetry Collector container...")
 	otelcol, err := dockerPool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "otel/opentelemetry-collector-contrib",
-		Tag:        "0.144.0",
+		Tag:        versionCollector,
 		Name:       fmt.Sprintf("otelcol-otel-test-%d", time.Now().UnixNano()),
 		Cmd:        []string{"--config=/etc/otelcol-config/" + configFile},
 		Mounts: []string{
@@ -124,14 +134,34 @@ func setupContainerCollector(t *testing.T, network *dockertest.Network, configFi
 	t.Log("OpenTelemetry Collector container started")
 }
 
-// buildOBIImage builds the OBI image.
+// dockerAuthConfigs loads Docker registry credentials from ~/.docker/config.json
+// if available. In CI, docker/login-action populates this file. Returns an empty
+// AuthConfigurations (no-op) when the config file is absent or unreadable.
+func dockerAuthConfigs() docker.AuthConfigurations {
+	if cfgs, err := docker.NewAuthConfigurationsFromDockerCfg(); err == nil {
+		return *cfgs
+	}
+	return docker.AuthConfigurations{}
+}
+
+// buildOBIImage builds the OBI image. When SKIP_DOCKER_BUILD is set, the image
+// has been pre-built for the VM workflow prior to QEMU startup.
 func buildOBIImage() error {
+	if os.Getenv("SKIP_DOCKER_BUILD") != "" {
+		_, err := dockerPool.Client.InspectImage("hatest-obi")
+		if err == nil {
+			fmt.Println("Skipping OBI image build (pre-built image found)")
+			return nil
+		}
+		fmt.Println("SKIP_DOCKER_BUILD set but hatest-obi image not found, building...")
+	}
 	return dockerPool.Client.BuildImage(docker.BuildImageOptions{
 		Name:         "hatest-obi",
 		ContextDir:   pathRoot,
 		Dockerfile:   "internal/test/integration/components/obi/Dockerfile",
 		OutputStream: os.Stdout,
 		ErrorStream:  os.Stderr,
+		AuthConfigs:  dockerAuthConfigs(),
 	})
 }
 
@@ -141,10 +171,11 @@ type obi struct {
 	Env []string
 	// SecurityConfigSuffix is the suffix for the security config file to use.
 	SecurityConfigSuffix string
+	Logs                 io.Writer
 }
 
 // instrument starts the OBI container to instrument the target application.
-func (o obi) instrument(t *testing.T, network *dockertest.Network, resource *dockertest.Resource, configFile string) { //nolint:unparam // configFile is always passed in current usages but may vary in future
+func (o obi) instrument(t *testing.T, network *dockertest.Network, configFile string) {
 	t.Helper()
 
 	t.Log("Starting OBI container with PID namespace sharing...")
@@ -152,46 +183,99 @@ func (o obi) instrument(t *testing.T, network *dockertest.Network, resource *doc
 	require.NoError(t, os.MkdirAll(pathOutput, 0o755), "could not create coverage directory")
 	require.NoError(t, os.MkdirAll(runOtelDir, 0o755), "could not create run-otel directory")
 
-	obi, err := dockerPool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "hatest-obi",
-		Name:       fmt.Sprintf("obi-otel-test-%d", time.Now().UnixNano()),
-		Networks:   []*dockertest.Network{network},
-		Cmd: []string{
-			"--config=/configs/" + configFile,
-		},
-		Mounts: []string{
-			filepath.Join(pathRoot, "internal/test/integration/configs") + ":/configs",
-			filepath.Join(pathRoot, "internal/test/integration/system/sys/kernel/security"+o.SecurityConfigSuffix) + ":/sys/kernel/security",
-			pathOutput + ":/coverage",
-			runOtelDir + ":/var/run/beyla",
-		},
-		Env: append([]string{
-			"GOCOVERDIR=/coverage",
-			"OTEL_EBPF_TRACE_PRINTER=text",
-			"OTEL_EBPF_METRICS_FEATURES=application,application_span",
-			"OTEL_EBPF_PROMETHEUS_FEATURES=application,application_span",
-			"OTEL_EBPF_DISCOVERY_POLL_INTERVAL=500ms",
-			"OTEL_EBPF_OTLP_TRACES_BATCH_TIMEOUT=1ms",
-			"OTEL_EBPF_SERVICE_NAMESPACE=integration-test",
-			"OTEL_EBPF_METRICS_INTERVAL=10ms",
-			"OTEL_EBPF_BPF_BATCH_TIMEOUT=10ms",
-			"OTEL_EBPF_LOG_LEVEL=DEBUG",
-			"OTEL_EBPF_BPF_DEBUG=TRUE",
-			"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PORT=8999",
-			"OTEL_EBPF_PROCESSES_INTERVAL=100ms",
-			"OTEL_EBPF_HOSTNAME=beyla",
-		}, o.Env...),
-		Privileged:   true,
-		ExposedPorts: []string{"8999/tcp"},
+	cntName := "obi"
+
+	var mounts []docker.Mount
+	for _, m := range []string{
+		filepath.Join(pathRoot, "internal/test/integration/configs") + ":/configs",
+		filepath.Join(pathRoot, "internal/test/integration/system/sys/kernel/security"+o.SecurityConfigSuffix) + ":/sys/kernel/security",
+		pathOutput + ":/coverage",
+		runOtelDir + ":/var/run/obi",
+	} {
+		s, d, err := opts.MountParser(m)
+		require.NoError(t, err, "could not parse mount %q", m)
+		mounts = append(mounts, docker.Mount{Source: s, Destination: d, RW: true})
+	}
+	var hostMounts []docker.HostMount
+	for _, m := range mounts {
+		hostMounts = append(hostMounts, docker.HostMount{Source: m.Source, Target: m.Destination, Type: "bind"})
+	}
+	hostConfig := &docker.HostConfig{
+		PublishAllPorts: true,
 		PortBindings: map[docker.Port][]docker.PortBinding{
 			"8999/tcp": {{HostIP: "127.0.0.1", HostPort: "8999"}},
 		},
-	}, func(hc *docker.HostConfig) {
-		hc.PidMode = "container:" + resource.Container.ID
+		Privileged: true,
+		PidMode:    "host",
+		Mounts:     hostMounts,
+	}
+	container, err := dockerPool.Client.CreateContainer(docker.CreateContainerOptions{
+		Context: t.Context(),
+		Name:    cntName,
+		Config: &docker.Config{
+			Cmd:   []string{"--config=/configs/" + configFile},
+			Image: "hatest-obi",
+			Env: append([]string{
+				"GOCOVERDIR=/coverage",
+				"OTEL_EBPF_TRACE_PRINTER=text",
+				"OTEL_EBPF_METRICS_FEATURES=application,application_span",
+				"OTEL_EBPF_PROMETHEUS_FEATURES=application,application_span",
+				"OTEL_EBPF_DISCOVERY_POLL_INTERVAL=500ms",
+				"OTEL_EBPF_OTLP_TRACES_BATCH_TIMEOUT=1ms",
+				"OTEL_EBPF_SERVICE_NAMESPACE=integration-test",
+				"OTEL_EBPF_METRICS_INTERVAL=10ms",
+				"OTEL_EBPF_BPF_BATCH_TIMEOUT=10ms",
+				"OTEL_EBPF_LOG_LEVEL=DEBUG",
+				"OTEL_EBPF_BPF_DEBUG=TRUE",
+				"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PORT=8999",
+				"OTEL_EBPF_PROCESSES_INTERVAL=100ms",
+				"OTEL_EBPF_HOSTNAME=beyla",
+			}, o.Env...),
+			StopSignal:   "SIGWINCH", // to support timeouts
+			ExposedPorts: map[docker.Port]struct{}{"8999/tcp": {}},
+			Mounts:       mounts,
+		},
+		HostConfig: hostConfig,
+		NetworkingConfig: &docker.NetworkingConfig{
+			EndpointsConfig: map[string]*docker.EndpointConfig{
+				network.Network.ID: {Aliases: []string{"obi"}},
+			},
+		},
 	})
-	require.NoError(t, err, "could not start OBI container")
+	require.NoError(t, err, "could not create test server container")
+
+	require.NoError(t, dockerPool.Client.StartContainer(container.ID, nil), "could not start test server container")
+
 	t.Cleanup(func() {
-		require.NoError(t, dockerPool.Purge(obi), "could not remove OBI container")
+		if o.Logs != nil {
+			if err := dockerPool.Client.Logs(docker.LogsOptions{
+				Stderr:       true,
+				Stdout:       true,
+				Container:    container.ID,
+				OutputStream: o.Logs,
+			}); err != nil {
+				t.Logf("could not stream logs: %v", err)
+			}
+		}
+
+		if err := dockerPool.Client.RemoveContainer(
+			docker.RemoveContainerOptions{ID: container.ID, Force: true, RemoveVolumes: true},
+		); err != nil {
+			t.Logf("could not remove OBI container: %v", err)
+		}
 	})
 	t.Log("OBI container started")
+}
+
+func createLogOutput(t *testing.T, testCase string) io.Writer {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(pathOutput, 0o755), "could not create coverage directory")
+	out, err := os.Create(filepath.Join(pathOutput, testCase+"-obi.log"))
+	require.NoError(t, err, "could not create logs file")
+	t.Cleanup(func() {
+		if err := out.Close(); err != nil {
+			t.Logf("could not close logs file: %v", err)
+		}
+	})
+	return out
 }

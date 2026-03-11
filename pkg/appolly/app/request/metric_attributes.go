@@ -129,17 +129,14 @@ func DBOperationName(val string) attribute.KeyValue {
 }
 
 func DBSystemName(val string) attribute.KeyValue {
-	// TODO: replace by semconv.DBSystemName when we update to OTEL semconv library 1.30
 	return attribute.Key(attr.DBSystemName).String(val)
 }
 
 func GraphqlOperationType(val string) attribute.KeyValue {
-	// TODO: replace once it's available in semconv
 	return attribute.Key(attr.GraphQLOperationType).String(val)
 }
 
 func ElasticsearchNodeName(val string) attribute.KeyValue {
-	// TODO: replace it when it's available in the imported semconv version
 	return attribute.Key(attr.ElasticsearchNodeName).String(val)
 }
 
@@ -291,6 +288,10 @@ func PeerAsClient(span *Span) string {
 
 func DNSQuestionName(val string) attribute.KeyValue {
 	return attribute.Key(attr.DNSQuestionName).String(val)
+}
+
+func Metadata(val string) attribute.KeyValue {
+	return attribute.Key(attr.GenAIMetadata).String(val)
 }
 
 // These are defined here https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html#group__CUDART__TYPES_1gg18fa99055ee694244a270e4d5101e95bdeec295de8a74ac2a74f98ffb6c5d7c7

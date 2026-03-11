@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/buildinfo"
 	"go.opentelemetry.io/obi/pkg/export"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
@@ -35,6 +36,11 @@ import (
 
 // injectable function reference for testing
 var timeNow = time.Now
+
+// CloudHostIDKey is the attribute key used to label metrics with the host id
+// of the monitored entity, as reported by the executable inspector. It is used
+// for both application-level and trace-level metrics.
+var CloudHostIDKey = "cloud_host_id"
 
 // using labels and names that are equivalent names to the OTEL attributes
 // but following the different naming conventions
@@ -57,10 +63,9 @@ const (
 	serviceNameKey      = "service_name"
 	serviceNamespaceKey = "service_namespace"
 
-	hostIDKey        = "host_id"
-	hostNameKey      = "host_name"
-	grafanaHostIDKey = "grafana_host_id"
-	osTypeKey        = "os_type"
+	hostIDKey   = "host_id"
+	hostNameKey = "host_name"
+	osTypeKey   = "os_type"
 
 	k8sNamespaceName   = "k8s_namespace_name"
 	k8sPodName         = "k8s_pod_name"
@@ -78,24 +83,26 @@ const (
 	k8sKind            = "k8s_kind"
 	k8sOwnerName       = "k8s_owner_name"
 
-	spanNameKey          = "span_name"
-	statusCodeKey        = "status_code"
-	spanKindKey          = "span_kind"
-	serviceInstanceKey   = "instance"
-	serviceJobKey        = "job"
-	sourceKey            = "source"
-	telemetryLanguageKey = "telemetry_sdk_language"
-	telemetrySDKKey      = "telemetry_sdk_name"
-	telemetrySDKVersion  = "telemetry_sdk_version"
+	spanNameKey            = "span_name"
+	statusCodeKey          = "status_code"
+	spanKindKey            = "span_kind"
+	serviceInstanceKey     = "instance"
+	serviceJobKey          = "job"
+	sourceKey              = "source"
+	telemetryLanguageKey   = "telemetry_sdk_language"
+	telemetrySDKKey        = "telemetry_sdk_name"
+	telemetrySDKVersion    = "telemetry_sdk_version"
+	telemetryDistroNameKey = "telemetry_distro_name"
+	telemetryDistroVersion = "telemetry_distro_version"
 
 	// default values for the histogram configuration
-	// from https://grafana.com/docs/mimir/latest/send/native-histograms/#migrate-from-classic-histograms
+	// recommended values for native histogram migration
 	defaultHistogramBucketFactor     = 1.1
 	defaultHistogramMaxBucketNumber  = uint32(100)
 	defaultHistogramMinResetDuration = 1 * time.Hour
 )
 
-// metrics for Beyla statistics
+// metrics for OBI statistics
 const (
 	buildInfoSuffix = "_build_info"
 
@@ -104,8 +111,8 @@ const (
 
 // not adding version, as it is a fixed value
 var (
-	beylaInfoLabelNames = []string{LanguageLabel}
-	hostInfoLabelNames  = []string{grafanaHostIDKey}
+	obiInfoLabelNames  = []string{LanguageLabel}
+	hostInfoLabelNames = []string{CloudHostIDKey}
 )
 
 // TODO: TLS
@@ -117,6 +124,7 @@ type PrometheusConfig struct {
 
 	// Features of metrics that can be exported. Accepted values: application, network,
 	// application_span, application_service_graph, ...
+	//
 	// Deprecated: use top-level MetricsConfig.Features instead.
 	DeprFeatures export.Features `yaml:"features" env:"OTEL_EBPF_PROMETHEUS_FEATURES" envSeparator:","`
 
@@ -132,8 +140,8 @@ type PrometheusConfig struct {
 
 	AllowServiceGraphSelfReferences bool `yaml:"allow_service_graph_self_references" env:"OTEL_EBPF_PROMETHEUS_ALLOW_SERVICE_GRAPH_SELF_REFERENCES"`
 
-	// Registry is only used for embedding Beyla within the Grafana Agent.
-	// It must be nil when Beyla runs as standalone
+	// Registry is only used for embedding OBI within third-party collectors.
+	// It must be nil when OBI runs as standalone
 	Registry *prometheus.Registry `yaml:"-"`
 
 	// ExtraResourceLabels adds extra metadata labels to Prometheus metrics from sources whose availability can't be known
@@ -163,7 +171,7 @@ type metricsReporter struct {
 	input         <-chan []request.Span
 	processEvents <-chan exec.ProcessEvent
 
-	beylaInfo              *Expirer[prometheus.Gauge]
+	obiInfo                *Expirer[prometheus.Gauge]
 	httpDuration           *Expirer[prometheus.Histogram]
 	httpClientDuration     *Expirer[prometheus.Histogram]
 	grpcDuration           *Expirer[prometheus.Histogram]
@@ -232,7 +240,7 @@ type metricsReporter struct {
 
 	kubeEnabled   bool
 	dockerEnabled bool
-	hostID        string
+	nodeMeta      meta.NodeMeta
 
 	serviceMap  map[svc.UID]svc.Attrs
 	pidsTracker otel.PidServiceTracker
@@ -401,7 +409,7 @@ func newReporter(
 		dockerEnabled:              dockerEnabled,
 		extraMetadataLabels:        extraMetadataLabels,
 		extraSpanMetadataLabels:    extraSpanMetadataLabels,
-		hostID:                     ctxInfo.HostID,
+		nodeMeta:                   ctxInfo.NodeMeta,
 		clock:                      clock,
 		is:                         is,
 		promConnect:                ctxInfo.Prometheus,
@@ -424,10 +432,10 @@ func newReporter(
 		attrCudaMemoryCopies:       attrCudaMemoryCopies,
 		attrDNSLookupDuration:      attrDNSLookupDuration,
 		attrSvcGraph:               attrSvcGraph,
-		beylaInfo: NewExpirer[prometheus.Gauge](prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		obiInfo: NewExpirer[prometheus.Gauge](prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: attr.VendorPrefix + buildInfoSuffix,
 			Help: "A metric with a constant '1' value labeled by version, revision, branch, " +
-				"goversion from which Beyla was built, the goos and goarch for the build, and the" +
+				"goversion from which OBI was built, the goos and goarch for the build, and the" +
 				"language of the reported services",
 			ConstLabels: map[string]string{
 				"goarch":    runtime.GOARCH,
@@ -436,7 +444,7 @@ func newReporter(
 				"version":   buildinfo.Version,
 				"revision":  buildinfo.Revision,
 			},
-		}, beylaInfoLabelNames).MetricVec, clock.Time, cfg.TTL),
+		}, obiInfoLabelNames).MetricVec, clock.Time, cfg.TTL),
 		httpDuration: optionalHistogramProvider(is.HTTPEnabled(), func() *Expirer[prometheus.Histogram] {
 			return NewExpirer[prometheus.Histogram](prometheus.NewHistogramVec(prometheus.HistogramOpts{
 				Name:                            attributes.HTTPServerDuration.Prom,
@@ -579,7 +587,7 @@ func newReporter(
 			return prometheus.NewGaugeVec(prometheus.GaugeOpts{
 				Name: TracesTargetInfo,
 				Help: "target service information in trace span metric format",
-			}, labelNamesTargetInfo(kubeEnabled, dockerEnabled, extraMetadataLabels))
+			}, labelNamesTargetInfo(kubeEnabled, dockerEnabled, &ctxInfo.NodeMeta, extraMetadataLabels))
 		}),
 		tracesHostInfo: optionalGaugeProvider(jointMetricsConfig.Features.AppHost(), func() *Expirer[prometheus.Gauge] {
 			return NewExpirer[prometheus.Gauge](prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -622,7 +630,7 @@ func newReporter(
 		targetInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: TargetInfo,
 			Help: "attributes associated to a given monitored entity",
-		}, labelNamesTargetInfo(kubeEnabled, dockerEnabled, extraMetadataLabels)),
+		}, labelNamesTargetInfo(kubeEnabled, dockerEnabled, &ctxInfo.NodeMeta, extraMetadataLabels)),
 		cudaKernelCallsTotal: optionalCounterProvider(is.GPUEnabled(), func() *Expirer[prometheus.Counter] {
 			return NewExpirer[prometheus.Counter](prometheus.NewCounterVec(prometheus.CounterOpts{
 				Name: attributes.GPUCudaKernelLaunchCalls.Prom,
@@ -690,7 +698,7 @@ func newReporter(
 	registeredMetrics := []prometheus.Collector{mr.targetInfo}
 
 	if !mr.cfg.DisableBuildInfo {
-		registeredMetrics = append(registeredMetrics, mr.beylaInfo)
+		registeredMetrics = append(registeredMetrics, mr.obiInfo)
 	}
 
 	if jointMetricsConfig.Features.AppRED() {
@@ -845,7 +853,7 @@ func (r *metricsReporter) otelMetricsObserved(span *request.Span) bool {
 }
 
 func (r *metricsReporter) otelSpanMetricsObserved(span *request.Span) bool {
-	return span.Service.Features.AnySpanMetrics() && !span.Service.ExportsOTelMetricsSpan()
+	return span.Service.Features.AnySpanMetrics() && !span.Service.ExportsOTelMetricsSpan() && !span.IsDNSSpan()
 }
 
 func (r *metricsReporter) otelSpanFiltered(span *request.Span) bool {
@@ -861,9 +869,9 @@ func (r *metricsReporter) observe(span *request.Span) {
 		return
 	}
 	t := span.Timings()
-	r.beylaInfo.WithLabelValues(span.Service.SDKLanguage.String()).Metric.Set(1.0)
+	r.obiInfo.WithLabelValues(span.Service.SDKLanguage.String()).Metric.Set(1.0)
 	if span.Service.Features.AppHost() {
-		r.tracesHostInfo.WithLabelValues(r.hostID).Metric.Set(1.0)
+		r.tracesHostInfo.WithLabelValues(r.nodeMeta.HostID).Metric.Set(1.0)
 	}
 	duration := t.End.Sub(t.RequestStart).Seconds()
 
@@ -1097,7 +1105,7 @@ func (r *metricsReporter) labelValuesSpans(span *request.Span) []string {
 	return values
 }
 
-func labelNamesTargetInfo(kubeEnabled, dockerEnabled bool, extraMetadataLabelNames []attr.Name) []string {
+func labelNamesTargetInfo(kubeEnabled, dockerEnabled bool, nodeMeta *meta.NodeMeta, extraMetadataLabelNames []attr.Name) []string {
 	names := []string{
 		hostIDKey,
 		hostNameKey,
@@ -1108,6 +1116,8 @@ func labelNamesTargetInfo(kubeEnabled, dockerEnabled bool, extraMetadataLabelNam
 		telemetryLanguageKey,
 		telemetrySDKKey,
 		telemetrySDKVersion,
+		telemetryDistroNameKey,
+		telemetryDistroVersion,
 		sourceKey,
 		osTypeKey,
 	}
@@ -1119,6 +1129,10 @@ func labelNamesTargetInfo(kubeEnabled, dockerEnabled bool, extraMetadataLabelNam
 		names = appendDockerLabelNames(names)
 	}
 
+	for _, entry := range nodeMeta.Metadata {
+		names = append(names, entry.Key.Prom())
+	}
+
 	for _, mdn := range extraMetadataLabelNames {
 		names = append(names, mdn.Prom())
 	}
@@ -1128,7 +1142,7 @@ func labelNamesTargetInfo(kubeEnabled, dockerEnabled bool, extraMetadataLabelNam
 
 func (r *metricsReporter) labelValuesTargetInfo(service *svc.Attrs) []string {
 	values := []string{
-		r.hostID,
+		r.nodeMeta.HostID,
 		service.HostName,
 		service.UID.Name,
 		service.UID.Namespace,
@@ -1136,7 +1150,9 @@ func (r *metricsReporter) labelValuesTargetInfo(service *svc.Attrs) []string {
 		service.Job(),
 		service.SDKLanguage.String(),
 		attr.VendorSDKName,
-		buildinfo.Version,
+		attr.VendorSDKVersion,
+		attr.TelemetryDistroName,
+		attr.TelemetryDistroVersion,
 		attr.VendorPrefix,
 		"linux",
 	}
@@ -1147,6 +1163,10 @@ func (r *metricsReporter) labelValuesTargetInfo(service *svc.Attrs) []string {
 
 	if r.dockerEnabled {
 		values = appendDockerLabelValuesService(values, service)
+	}
+
+	for _, entry := range r.nodeMeta.Metadata {
+		values = append(values, entry.Value)
 	}
 
 	for _, k := range r.extraMetadataLabels {

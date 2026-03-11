@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/config"
 	"go.opentelemetry.io/obi/pkg/export"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
@@ -47,7 +48,7 @@ func gctx(groups attributes.AttrGroups, mcfg *otelcfg.MetricsConfig) *global.Con
 		Metrics:               imetrics.NoopReporter{},
 		MetricAttributeGroups: groups,
 		K8sInformer:           kube.NewMetadataProvider(kube.MetadataConfig{Enable: kubeflags.EnabledFalse}, imetrics.NoopReporter{}),
-		HostID:                "host-id",
+		NodeMeta:              meta.NodeMeta{HostID: "host-id"},
 		OTELMetricsExporter:   &otelcfg.MetricsExporterInstancer{Cfg: mcfg},
 	}
 }
@@ -107,6 +108,8 @@ func TestBasicPipeline(t *testing.T) {
 		delete(event.ResourceAttributes, string(semconv.ServiceInstanceIDKey))
 		assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 		delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+		assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+		delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 		if event.Name == "http.server.request.duration" {
 			break
 		}
@@ -135,7 +138,8 @@ func TestBasicPipeline(t *testing.T) {
 			string(semconv.ServiceNameKey):          "foo-svc",
 			string(semconv.ServiceNamespaceKey):     "ns",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 		},
 		Type:     pmetric.MetricTypeHistogram,
@@ -327,6 +331,8 @@ func TestRouteConsolidation(t *testing.T) {
 		delete(event.ResourceAttributes, string(semconv.ServiceInstanceIDKey))
 		assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 		delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+		assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+		delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 	}
 	assert.Equal(t, collector.MetricRecord{
 		Name: "http.server.request.duration",
@@ -346,7 +352,8 @@ func TestRouteConsolidation(t *testing.T) {
 			string(semconv.ServiceNameKey):          "svc-1",
 			string(semconv.ServiceNamespaceKey):     "ns",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 		},
 		Type:     pmetric.MetricTypeHistogram,
@@ -372,7 +379,8 @@ func TestRouteConsolidation(t *testing.T) {
 			string(semconv.ServiceNameKey):          "svc-1",
 			string(semconv.ServiceNamespaceKey):     "ns",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 		},
 		Type:     pmetric.MetricTypeHistogram,
@@ -398,7 +406,8 @@ func TestRouteConsolidation(t *testing.T) {
 			string(semconv.ServiceNameKey):          "svc-1",
 			string(semconv.ServiceNamespaceKey):     "ns",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 		},
 		Type:     pmetric.MetricTypeHistogram,
@@ -444,6 +453,8 @@ func TestGRPCPipeline(t *testing.T) {
 	delete(event.ResourceAttributes, string(semconv.ServiceInstanceIDKey))
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.Equal(t, collector.MetricRecord{
 		Name: "rpc.server.duration",
@@ -463,7 +474,8 @@ func TestGRPCPipeline(t *testing.T) {
 			string(semconv.HostNameKey):             "the-host",
 			string(semconv.ServiceNameKey):          "grpc-svc",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 		},
 		Type:     pmetric.MetricTypeHistogram,
@@ -545,6 +557,8 @@ func TestBasicPipelineInfo(t *testing.T) {
 	delete(event.ResourceAttributes, string(semconv.ServiceInstanceIDKey))
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.Equal(t, collector.MetricRecord{
 		Name: "http.server.request.duration",
@@ -564,7 +578,8 @@ func TestBasicPipelineInfo(t *testing.T) {
 			string(semconv.HostNameKey):             "the-host",
 			string(semconv.ServiceNameKey):          "comm",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 		},
 		Type:     pmetric.MetricTypeHistogram,
@@ -734,6 +749,8 @@ func getHostname() string {
 func matchTraceEvent(t require.TestingT, name string, event collector.TraceRecord) {
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.NotEmpty(t, event.Attributes["span_id"])
 	assert.Equal(t, collector.TraceRecord{
@@ -756,7 +773,8 @@ func matchTraceEvent(t require.TestingT, name string, event collector.TraceRecor
 			string(semconv.ServiceNameKey):          "bar-svc",
 			string(semconv.ServiceNamespaceKey):     "ns",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 			string(semconv.OTelScopeNameKey):        "go.opentelemetry.io/obi",
 			"overridden":                            "attr",
@@ -768,6 +786,8 @@ func matchTraceEvent(t require.TestingT, name string, event collector.TraceRecor
 func matchInnerTraceEvent(t require.TestingT, name string, event collector.TraceRecord) {
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.NotEmpty(t, event.Attributes["span_id"])
 	assert.Equal(t, collector.TraceRecord{
@@ -782,7 +802,8 @@ func matchInnerTraceEvent(t require.TestingT, name string, event collector.Trace
 			string(semconv.ServiceNameKey):          "bar-svc",
 			string(semconv.ServiceNamespaceKey):     "ns",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 			string(semconv.OTelScopeNameKey):        "go.opentelemetry.io/obi",
 			"overridden":                            "attr",
@@ -794,6 +815,8 @@ func matchInnerTraceEvent(t require.TestingT, name string, event collector.Trace
 func matchGRPCTraceEvent(t *testing.T, name string, event collector.TraceRecord) {
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.Equal(t, collector.TraceRecord{
 		Name: name,
@@ -812,7 +835,8 @@ func matchGRPCTraceEvent(t *testing.T, name string, event collector.TraceRecord)
 			string(semconv.HostNameKey):             "the-host",
 			string(semconv.ServiceNameKey):          "svc",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 			string(semconv.OTelScopeNameKey):        "go.opentelemetry.io/obi",
 		},
@@ -823,6 +847,8 @@ func matchGRPCTraceEvent(t *testing.T, name string, event collector.TraceRecord)
 func matchInnerGRPCTraceEvent(t *testing.T, name string, event collector.TraceRecord) {
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.Equal(t, collector.TraceRecord{
 		Name: name,
@@ -835,7 +861,8 @@ func matchInnerGRPCTraceEvent(t *testing.T, name string, event collector.TraceRe
 			string(semconv.HostNameKey):             "the-host",
 			string(semconv.ServiceNameKey):          "svc",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 			string(semconv.OTelScopeNameKey):        "go.opentelemetry.io/obi",
 		},
@@ -874,6 +901,8 @@ func newHTTPInfo(method, path, peer string, status int) []request.Span {
 func matchInfoEvent(t *testing.T, name string, event collector.TraceRecord) {
 	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
 	delete(event.ResourceAttributes, string(semconv.TelemetrySDKVersionKey))
+	assert.NotEmpty(t, event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
+	delete(event.ResourceAttributes, string(semconv.TelemetryDistroVersionKey))
 
 	assert.Equal(t, collector.TraceRecord{
 		Name: name,
@@ -894,7 +923,8 @@ func matchInfoEvent(t *testing.T, name string, event collector.TraceRecord) {
 			string(semconv.HostNameKey):             "the-host",
 			string(semconv.ServiceNameKey):          "comm",
 			string(semconv.TelemetrySDKLanguageKey): "go",
-			string(semconv.TelemetrySDKNameKey):     "opentelemetry-ebpf-instrumentation",
+			string(semconv.TelemetrySDKNameKey):     "opentelemetry",
+			string(semconv.TelemetryDistroNameKey):  "opentelemetry-ebpf-instrumentation",
 			string(semconv.OSTypeKey):               "linux",
 			string(semconv.OTelScopeNameKey):        "go.opentelemetry.io/obi",
 		},

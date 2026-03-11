@@ -27,11 +27,16 @@
 
 #include <gotracer/go_offsets.h>
 
+#include <gotracer/maps/mongo.h>
+
 #include <logger/bpf_dbg.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
 enum { W3C_KEY_LENGTH = 11, W3C_VAL_LENGTH = 55 };
+
+static unsigned char tp_encoded[] = {
+    0x4d, 0x83, 0x21, 0x6b, 0x1d, 0x85, 0xa9, 0x3f}; // hpack encoded "traceparent"
 
 // Temporary information about a function invocation. It stores the invocation time of a function
 // as well as the value of registers at the invocation time. This way we can retrieve them at the
@@ -119,13 +124,6 @@ struct {
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
 } ongoing_sql_queries SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_addr_key_t);           // key: goroutine id
-    __type(value, mongo_go_client_req_t); // the request
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} ongoing_mongo_requests SEC(".maps");
-
 typedef struct grpc_header_field {
     u8 *key_ptr;
     u64 key_len;
@@ -139,8 +137,8 @@ static __always_inline u8 valid_trace(const unsigned char *trace_id) {
 }
 
 static __always_inline void go_addr_key_from_id(go_addr_key_t *current, void *addr) {
-    u64 pid_tid = bpf_get_current_pid_tgid();
-    u32 pid = pid_from_pid_tgid(pid_tid);
+    const u64 pid_tid = bpf_get_current_pid_tgid();
+    const u32 pid = pid_from_pid_tgid(pid_tid);
 
     current->addr = (u64)addr;
     current->pid = pid;
@@ -284,7 +282,7 @@ server_trace_parent(void *goroutine_addr, tp_info_t *tp, tp_info_t *found_tp) {
 static __always_inline tp_info_t *tp_info_from_parent_go(go_addr_key_t *g_key, u64 *parent_found) {
     tp_info_t *tp = 0;
 
-    u64 parent_id = find_parent_goroutine(g_key);
+    const u64 parent_id = find_parent_goroutine(g_key);
     go_addr_key_t p_key = {};
     go_addr_key_from_id(&p_key, (void *)parent_id);
 
@@ -370,7 +368,7 @@ static __always_inline u8 get_conn_info_from_fd(void *fd_ptr, connection_info_t 
         void *laddr_ptr = 0;
         void *raddr_ptr = 0;
         off_table_t *ot = get_offsets_table();
-        u64 fd_laddr_pos = go_offset_of(ot, (go_offset){.v = _fd_laddr_pos});
+        const u64 fd_laddr_pos = go_offset_of(ot, (go_offset){.v = _fd_laddr_pos});
 
         bpf_probe_read(
             &laddr_ptr, sizeof(laddr_ptr), (void *)(fd_ptr + fd_laddr_pos + 8)); // find laddr
@@ -447,7 +445,7 @@ static __always_inline void process_meta_frame_headers(void *frame, tp_info_t *t
     off_table_t *ot = get_offsets_table();
 
     void *fields = 0;
-    u64 fields_off = go_offset_of(ot, (go_offset){.v = _meta_headers_frame_fields_ptr_pos});
+    const u64 fields_off = go_offset_of(ot, (go_offset){.v = _meta_headers_frame_fields_ptr_pos});
     bpf_probe_read(&fields, sizeof(fields), (void *)(frame + fields_off));
     u64 fields_len = 0;
     bpf_probe_read(&fields_len, sizeof(fields_len), (void *)(frame + fields_off + 8));

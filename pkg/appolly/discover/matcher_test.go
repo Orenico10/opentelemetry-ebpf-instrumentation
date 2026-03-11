@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/internal/testutil"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -40,6 +41,62 @@ func TestCriteriaMatcher(t *testing.T) {
   - name: both
     open_ports: 443
     exe_path_regexp: "server"
+  - name: exec-arg
+    exe_path: /bin/python
+    cmd_args: "my-server.py"
+  - name: arg-only
+    cmd_args: "my-server2.py"
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/weird33", 2: "/bin/weird33", 3: "server",
+			4: "/bin/something", 5: "server", 6: "/bin/clientweird99",
+			7: "/bin/python", 8: "/bin/python", 9: "/bin/frobnitz",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts, CmdArgs: pp.cmdArgs}, nil
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1, 2, 3}}}, // pass
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}}},       // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{8433}}},    // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}}},    // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{443}}},     // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6}},                               // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 7, cmdArgs: "my-server.py"}},      // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 8, cmdArgs: "other-server.py"}},   // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 9, cmdArgs: "my-server2.py"}},     // pass
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 6)
+
+	testMatch(t, matches[0], "exec-only", "", services.ProcessInfo{Pid: 1, ExePath: "/bin/weird33", OpenPorts: []uint32{1, 2, 3}})
+	testMatch(t, matches[1], "port-only", "foo", services.ProcessInfo{Pid: 4, ExePath: "/bin/something", OpenPorts: []uint32{8083}})
+	testMatch(t, matches[2], "both", "", services.ProcessInfo{Pid: 5, ExePath: "server", OpenPorts: []uint32{443}})
+	testMatch(t, matches[3], "exec-only", "", services.ProcessInfo{Pid: 6, ExePath: "/bin/clientweird99"})
+	testMatch(t, matches[4], "exec-arg", "", services.ProcessInfo{Pid: 7, ExePath: "/bin/python", CmdArgs: "my-server.py"})
+	testMatch(t, matches[5], "arg-only", "", services.ProcessInfo{Pid: 9, ExePath: "/bin/frobnitz", CmdArgs: "my-server2.py"})
+}
+
+func TestCriteriaMatcherLanguage(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: go-and-java
+    namespace: foo
+    languages: "go|java"
+  - name: rust
+    languages: rust
 `), &pipeConfig))
 
 	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
@@ -59,21 +116,21 @@ func TestCriteriaMatcher(t *testing.T) {
 		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts}, nil
 	}
 	discoveredProcesses.Send([]Event[ProcessAttrs]{
-		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1, 2, 3}}}, // pass
-		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}}},       // filter
-		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{8433}}},    // filter
-		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}}},    // pass
-		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{443}}},     // pass
-		{Type: EventCreated, Obj: ProcessAttrs{pid: 6}},                               // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1, 2, 3}, detectedType: svc.InstrumentableCPP}},     // filter
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}, detectedType: svc.InstrumentableGeneric}},       // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{8433}, detectedType: svc.InstrumentableJavaNative}}, // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}, detectedType: svc.InstrumentableJava}},       // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{443}, detectedType: svc.InstrumentableGolang}},      // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6, detectedType: svc.InstrumentableRust}},                                  // pass
 	})
 
 	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
 	require.Len(t, matches, 4)
 
-	testMatch(t, matches[0], "exec-only", "", services.ProcessInfo{Pid: 1, ExePath: "/bin/weird33", OpenPorts: []uint32{1, 2, 3}})
-	testMatch(t, matches[1], "port-only", "foo", services.ProcessInfo{Pid: 4, ExePath: "/bin/something", OpenPorts: []uint32{8083}})
-	testMatch(t, matches[2], "both", "", services.ProcessInfo{Pid: 5, ExePath: "server", OpenPorts: []uint32{443}})
-	testMatch(t, matches[3], "exec-only", "", services.ProcessInfo{Pid: 6, ExePath: "/bin/clientweird99"})
+	testMatch(t, matches[0], "go-and-java", "foo", services.ProcessInfo{Pid: 3, ExePath: "server", OpenPorts: []uint32{8433}})
+	testMatch(t, matches[1], "go-and-java", "foo", services.ProcessInfo{Pid: 4, ExePath: "/bin/something", OpenPorts: []uint32{8083}})
+	testMatch(t, matches[2], "go-and-java", "foo", services.ProcessInfo{Pid: 5, ExePath: "server", OpenPorts: []uint32{443}})
+	testMatch(t, matches[3], "rust", "", services.ProcessInfo{Pid: 6, ExePath: "/bin/clientweird99"})
 }
 
 func TestCriteriaMatcher_Exclude(t *testing.T) {
@@ -336,8 +393,8 @@ func TestInstrumentation_CoexistingWithDeprecatedServices(t *testing.T) {
 	neitherPass := services.NewGlob("*/neither-pass")
 	bothPass := services.NewGlob("*/{must,also}-pass")
 
-	passPort := services.PortEnum{Ranges: []services.PortRange{{Start: 80}}}
-	allPorts := services.PortEnum{Ranges: []services.PortRange{{Start: 1, End: 65535}}}
+	passPort := services.IntEnum{Ranges: []services.IntRange{{Start: 80}}}
+	allPorts := services.IntEnum{Ranges: []services.IntRange{{Start: 1, End: 65535}}}
 
 	passRE := services.NewRegexp("must-pass")
 	notPassRE := services.NewRegexp("dont-pass")
@@ -459,6 +516,74 @@ func TestInstrumentation_CoexistingWithDeprecatedServices(t *testing.T) {
 			assert.Equal(t, services.ProcessInfo{Pid: 2, ExePath: "/bin/also-pass", OpenPorts: []uint32{80}}, *m.Obj.Process)
 		})
 	}
+}
+
+func TestCriteriaMatcher_TargetPIDs(t *testing.T) {
+	t.Run("single PID", func(t *testing.T) {
+		// When TargetPIDs has one PID, only that PID is matched.
+		pipeConfig := obi.Config{
+			TargetPIDs:       services.IntEnum{Ranges: []services.IntRange{{Start: 42}}},
+			ServiceName:      "targeted-svc",
+			ServiceNamespace: "target-ns",
+		}
+		discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+		filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+		filteredProcesses := filteredProcessesQu.Subscribe()
+		matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu)(t.Context())
+		require.NoError(t, err)
+		go matcherFunc(t.Context())
+		defer filteredProcessesQu.Close()
+
+		processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+			return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+		}
+		discoveredProcesses.Send([]Event[ProcessAttrs]{
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{80}}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 42, openPorts: []uint32{}}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 100, openPorts: []uint32{443}}},
+		})
+
+		matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+		require.Len(t, matches, 1)
+		assert.Equal(t, app.PID(42), matches[0].Obj.Process.Pid)
+		pids, ok := matches[0].Obj.Criteria[0].GetPIDs()
+		assert.True(t, ok)
+		assert.Equal(t, []app.PID{42}, pids)
+	})
+
+	t.Run("multiple PIDs", func(t *testing.T) {
+		pipeConfig := obi.Config{
+			TargetPIDs:       services.IntEnum{Ranges: []services.IntRange{{Start: 10}, {Start: 20}, {Start: 30}}},
+			ServiceName:      "multi-svc",
+			ServiceNamespace: "ns",
+		}
+		discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+		filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+		filteredProcesses := filteredProcessesQu.Subscribe()
+		matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu)(t.Context())
+		require.NoError(t, err)
+		go matcherFunc(t.Context())
+		defer filteredProcessesQu.Close()
+
+		processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+			return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+		}
+		discoveredProcesses.Send([]Event[ProcessAttrs]{
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 1}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 10}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 15}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 20}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 30}},
+		})
+
+		matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+		require.Len(t, matches, 3)
+		pids := make([]app.PID, len(matches))
+		for i, m := range matches {
+			pids[i] = m.Obj.Process.Pid
+		}
+		assert.ElementsMatch(t, []app.PID{10, 20, 30}, pids)
+	})
 }
 
 func TestCriteriaMatcher_Granular(t *testing.T) {

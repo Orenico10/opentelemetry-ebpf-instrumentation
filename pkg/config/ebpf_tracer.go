@@ -5,9 +5,12 @@ package config // import "go.opentelemetry.io/obi/pkg/config"
 
 import (
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/invopop/jsonschema"
 )
 
 type ContextPropagationMode uint8
@@ -18,13 +21,17 @@ type RedisDBCacheConfig struct {
 }
 
 const (
-	ContextPropagationDisabled  ContextPropagationMode = 0
-	ContextPropagationHeaders   ContextPropagationMode = 1 << 0 // HTTP headers
-	ContextPropagationTCP       ContextPropagationMode = 1 << 1 // TCP options
-	ContextPropagationIPOptions ContextPropagationMode = 1 << 2 // IP options (dangerous)
+	ContextPropagationDisabled ContextPropagationMode = 0
+	ContextPropagationHeaders  ContextPropagationMode = 1 << 0 // HTTP headers
+	ContextPropagationTCP      ContextPropagationMode = 1 << 1 // TCP options
 
 	// Convenience aliases
-	ContextPropagationAll = ContextPropagationHeaders | ContextPropagationTCP
+	ContextPropagationAll         = ContextPropagationHeaders | ContextPropagationTCP
+	StrContextPropagationDisabled = "disabled"
+	StrContextPropagationAll      = "all"
+	StrContextPropagationHeaders  = "headers"
+	StrContextPropagationHTTP     = "http"
+	StrContextPropagationTCP      = "tcp"
 )
 
 // EBPFTracer configuration for eBPF programs
@@ -57,16 +64,15 @@ type EBPFTracer struct {
 	HTTPRequestTimeout time.Duration `yaml:"http_request_timeout" env:"OTEL_EBPF_BPF_HTTP_REQUEST_TIMEOUT" validate:"gte=0"`
 
 	// Enables distributed context propagation.
-	// Can be a combination of: headers, tcp, ip (e.g., "headers,tcp" or "all")
+	// Can be a combination of: headers, tcp (e.g., "headers,tcp" or "all")
 	ContextPropagation ContextPropagationMode `yaml:"context_propagation" env:"OTEL_EBPF_BPF_CONTEXT_PROPAGATION"`
 
 	// Skips checking the kernel version for bpf_loop functionality. Some modified kernels have this
 	// backported prior to version 5.17.
 	OverrideBPFLoopEnabled bool `yaml:"override_bpfloop_enabled" env:"OTEL_EBPF_OVERRIDE_BPF_LOOP_ENABLED" validate:"boolean"`
 
-	// Select the TC attachment backend: accepted values are 'tc' (netlink),
-	// and 'tcx'
-	TCBackend TCBackend `yaml:"traffic_control_backend" env:"OTEL_EBPF_BPF_TC_BACKEND" validate:"oneof=1 2 3"`
+	// Select the TC attachment backend: accepted values are 'tc' (netlink), and 'tcx'
+	TCBackend TCBackend `yaml:"traffic_control_backend" env:"OTEL_EBPF_BPF_TC_BACKEND" validate:"oneof=1 2 3" jsonschema:"type=string,enum=tc,enum=tcx,enum=auto"`
 
 	// Disables OBI black-box context propagation. Used for testing purposes only.
 	DisableBlackBoxCP bool `yaml:"disable_black_box_cp" env:"OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP" validate:"boolean"`
@@ -144,10 +150,13 @@ func (e *EBPFTracer) CudaInstrumentationEnabled() bool {
 }
 
 // Per-protocol data buffer size in bytes.
-// Max: 8192 bytes.
+// Max:
+// 64K bytes for HTTP.
+// 8K bytes for other protocols.
+//
 // Default: 0 (disabled).
 type EBPFBufferSizes struct {
-	HTTP     uint32 `yaml:"http" env:"OTEL_EBPF_BPF_BUFFER_SIZE_HTTP" validate:"lte=8192"`
+	HTTP     uint32 `yaml:"http" env:"OTEL_EBPF_BPF_BUFFER_SIZE_HTTP" validate:"lte=65536"`
 	MySQL    uint32 `yaml:"mysql" env:"OTEL_EBPF_BPF_BUFFER_SIZE_MYSQL" validate:"lte=8192"`
 	MSSQL    uint32 `yaml:"mssql" env:"OTEL_EBPF_BPF_BUFFER_SIZE_MSSQL"`
 	Kafka    uint32 `yaml:"kafka" env:"OTEL_EBPF_BPF_BUFFER_SIZE_KAFKA" validate:"lte=8192"`
@@ -164,11 +173,6 @@ func (m ContextPropagationMode) HasTCP() bool {
 	return m&ContextPropagationTCP != 0
 }
 
-// HasIPOptions returns true if IP options context propagation is enabled
-func (m ContextPropagationMode) HasIPOptions() bool {
-	return m&ContextPropagationIPOptions != 0
-}
-
 // IsEnabled returns true if any context propagation is enabled
 func (m ContextPropagationMode) IsEnabled() bool {
 	return m != ContextPropagationDisabled
@@ -179,10 +183,10 @@ func (m *ContextPropagationMode) UnmarshalText(text []byte) error {
 
 	// Handle simple cases first
 	switch str {
-	case "all":
+	case StrContextPropagationAll:
 		*m = ContextPropagationAll
 		return nil
-	case "disabled", "":
+	case StrContextPropagationDisabled, "":
 		*m = ContextPropagationDisabled
 		return nil
 	}
@@ -194,14 +198,14 @@ func (m *ContextPropagationMode) UnmarshalText(text []byte) error {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		switch part {
-		case "headers", "http":
+		case StrContextPropagationHeaders, StrContextPropagationHTTP:
 			result |= ContextPropagationHeaders
-		case "tcp":
+		case StrContextPropagationTCP:
 			result |= ContextPropagationTCP
 		case "ip":
-			result |= ContextPropagationIPOptions
+			slog.Warn("context_propagation value 'ip' is deprecated and has no effect; IP options injection has been removed")
 		default:
-			return fmt.Errorf("invalid value for context_propagation: '%s' (valid: all, disabled, headers, tcp, ip)", part)
+			return fmt.Errorf("invalid value for context_propagation: '%s' (valid: all, disabled, headers, tcp)", part)
 		}
 	}
 
@@ -225,13 +229,32 @@ func (m ContextPropagationMode) MarshalText() ([]byte, error) {
 	if m.HasTCP() {
 		parts = append(parts, "tcp")
 	}
-	if m.HasIPOptions() {
-		parts = append(parts, "ip")
-	}
-
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("invalid context propagation mode: %d", m)
 	}
 
 	return []byte(strings.Join(parts, ",")), nil
+}
+
+func (ContextPropagationMode) JSONSchema() *jsonschema.Schema {
+	options := []string{StrContextPropagationHeaders, StrContextPropagationHTTP, StrContextPropagationTCP}
+	optionsStr := strings.Join(options, "|")
+	OptionsRegexp := fmt.Sprintf("^(%s)(,(%s))*$", optionsStr, optionsStr)
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{
+				Type:        "string",
+				Enum:        []any{StrContextPropagationAll, StrContextPropagationDisabled, ""},
+				Description: "Enable all propagation methods, disable propagation, or use empty string for disabled",
+			},
+			{
+				Type:        "string",
+				Description: "List of propagation methods to enable (headers/http for HTTP headers, tcp for TCP options), separated by commas",
+				Examples:    []any{"headers", "tcp", "headers,tcp"},
+				Pattern:     OptionsRegexp,
+			},
+		},
+		Title:       "Context Propagation Mode",
+		Description: "Configures distributed context propagation. Can be 'all' to enable all methods, 'disabled'/'' to disable, or a list of specific methods: 'headers' (or 'http') for HTTP headers, 'tcp' for TCP options.",
+	}
 }

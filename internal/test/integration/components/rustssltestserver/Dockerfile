@@ -1,10 +1,7 @@
-FROM debian:bookworm@sha256:34e7f0ae7c10a61bfbef6e1b2ed205d9b47bb12e90c50696f729a5c7a01cf1f2 AS rustbuilder
+FROM rust:1.85.0-bookworm@sha256:0ff31c9ffa641a62e48d543fb00b4960955ea375f40776f40f585b89e654cc5e AS rustbuilder
 
 RUN apt update
 RUN apt install -y build-essential curl pkg-config libssl-dev
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
-
-ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Set the working directory to /build
 WORKDIR /build
@@ -14,10 +11,10 @@ COPY internal/test/integration/components/rustssltestserver .
 COPY internal/test/integration/components/rusttestserver/large_data.json .
 
 # Build
-RUN cargo build --release
+RUN cargo build --locked --release
 
 # The App Image
-FROM debian:bookworm-slim@sha256:98f4b71de414932439ac6ac690d7060df1f27161073c5036a7553723881bffbe
+FROM debian:bookworm-slim@sha256:74d56e3931e0d5a1dd51f8c8a2466d21de84a271cd3b5a733b803aa91abf4421
 
 RUN apt update
 RUN apt install libssl3 -y
