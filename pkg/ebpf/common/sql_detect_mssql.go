@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/internal/largebuf"
@@ -85,15 +86,29 @@ func isMSSQL(b *largebuf.LargeBuffer) bool {
 	return window == 0
 }
 
-func ucs2ToUTF8(b []byte) string {
+func ucs2ToUTF8(b []byte) []byte {
 	if len(b)%2 != 0 {
 		b = b[:len(b)-1]
 	}
-	u16s := make([]uint16, len(b)/2)
-	for i := 0; i < len(u16s); i++ {
-		u16s[i] = binary.LittleEndian.Uint16(b[i*2:])
+
+	out := make([]byte, 0, len(b))
+
+	for i := 0; i < len(b); i += 2 {
+		u1 := binary.LittleEndian.Uint16(b[i:])
+
+		if utf16.IsSurrogate(rune(u1)) && i+2 < len(b) {
+			u2 := binary.LittleEndian.Uint16(b[i+2:])
+			if r := utf16.DecodeRune(rune(u1), rune(u2)); r != utf8.RuneError {
+				out = utf8.AppendRune(out, r)
+				i += 2
+				continue
+			}
+		}
+
+		out = utf8.AppendRune(out, rune(u1))
 	}
-	return string(utf16.Decode(u16s))
+
+	return out
 }
 
 func mssqlPreparedStatements(b *largebuf.LargeBuffer) (string, string, string) {
@@ -106,7 +121,7 @@ func mssqlPreparedStatements(b *largebuf.LargeBuffer) (string, string, string) {
 		// SQL Batch
 		payload, _ := b.UnsafeViewAt(kMSSQLHeaderLen, b.Len()-kMSSQLHeaderLen)
 		stmt := ucs2ToUTF8(payload)
-		return detectSQL([]byte(stmt))
+		return detectSQL(stmt)
 	}
 
 	return "", "", ""
@@ -137,11 +152,11 @@ func handleMSSQL(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffe
 		case kMSSQLProcIDPrepExec:
 			// Extract SQL from payload
 			text := ucs2ToUTF8(payload)
-			op, table, stmt = detectSQL([]byte(text))
+			op, table, stmt = detectSQL(text)
 		case kMSSQLProcIDPrepare:
 			// Extract SQL and cache it
 			text := ucs2ToUTF8(payload)
-			_, _, stmt = detectSQL([]byte(text))
+			_, _, stmt = detectSQL(text)
 			handle := parseHandleFromPrepareResponse(respRaw)
 			if handle != 0 && stmt != "" {
 				parseCtx.mssqlPreparedStatements.Add(mssqlPreparedStatementsKey{
