@@ -76,22 +76,22 @@ func TestUCS2ToUTF8(t *testing.T) {
 	tests := []struct {
 		name string
 		buf  []byte
-		want string
+		want []byte
 	}{
 		{
 			name: "simple ascii",
 			buf:  []byte{'S', 0, 'E', 0, 'L', 0, 'E', 0, 'C', 0, 'T', 0},
-			want: "SELECT",
+			want: []byte{'S', 'E', 'L', 'E', 'C', 'T'},
 		},
 		{
 			name: "with special chars",
 			buf:  []byte{'S', 0, 'E', 0, 'L', 0, 'E', 0, 'C', 0, 'T', 0, ' ', 0, '*', 0, ' ', 0, 'F', 0, 'R', 0, 'O', 0, 'M', 0},
-			want: "SELECT * FROM",
+			want: []byte{'S', 'E', 'L', 'E', 'C', 'T', ' ', '*', ' ', 'F', 'R', 'O', 'M'},
 		},
 		{
 			name: "odd length",
 			buf:  []byte{'S', 0, 'E', 0, 'L', 0, 'E', 0, 'C', 0, 'T', 0, 'X'},
-			want: "SELECT",
+			want: []byte{'S', 'E', 'L', 'E', 'C', 'T'},
 		},
 	}
 
