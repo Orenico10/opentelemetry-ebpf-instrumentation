@@ -78,9 +78,9 @@ func isMSSQL(b *largebuf.LargeBuffer) bool {
 
 	// Check the length:
 	// 1. MUST be at least 8 bytes (the size of the header itself).
-	// 2. MUST be less than or equal to the maximum allowable negotiated packet 
-	//    size (32,767 bytes). 
-	// Note: While the *negotiated* packet size must be between 512 and 32,767, 
+	// 2. MUST be less than or equal to the maximum allowable negotiated packet
+	//    size (32,767 bytes).
+	// Note: While the *negotiated* packet size must be between 512 and 32,767,
 	// individual packets can be much smaller (e.g., a simple SELECT batch).
 	if length < uint16(kMSSQLHeaderLen) || length > kMSSQLMaxPacketSize {
 		return false
@@ -227,7 +227,7 @@ func parseMSSQLRPC(b *largebuf.LargeBuffer) (uint16, largebuf.LargeBufferReader,
 	if err != nil {
 		return 0, r, err
 	}
-	
+
 	if err := r.Skip(2); err != nil {
 		return procID, r, err
 	}
