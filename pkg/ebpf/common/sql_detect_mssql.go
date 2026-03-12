@@ -39,6 +39,10 @@ const (
 	kMSSQLFlagsLen    = 2
 	// Sum of Status, UserType, and Flags fields
 	kMSSQLReturnValueMetadataLen = kMSSQLStatusLen + kMSSQLUserTypeLen + kMSSQLFlagsLen
+
+	// Maximum size of a single TDS packet as defined by the protocol.
+	// Defaults to 4096, but can be negotiated up to 32767.
+	kMSSQLMaxPacketSize = 32767
 )
 
 func isMSSQL(b *largebuf.LargeBuffer) bool {
@@ -65,16 +69,20 @@ func isMSSQL(b *largebuf.LargeBuffer) bool {
 		return false
 	}
 
-	// Length is big-endian in TDS. It's the length of the packet including the header.
+	// Length is big-endian in TDS. It's the total number of bytes in the Packet
+	// including the 8-byte header.
 	length, err := b.U16BEAt(2)
 	if err != nil {
 		return false
 	}
-	// The length must be at least the header length.
-	// We also add an upper bound to avoid misinterpreting other protocols as MSSQL.
-	// The default TDS packet size is 4096, but can be negotiated up to 32767.
-	// We'll use a generous upper bound.
-	if length < uint16(kMSSQLHeaderLen) || length > 32768 {
+
+	// Check the length:
+	// 1. MUST be at least 8 bytes (the size of the header itself).
+	// 2. MUST be less than or equal to the maximum allowable negotiated packet 
+	//    size (32,767 bytes). 
+	// Note: While the *negotiated* packet size must be between 512 and 32,767, 
+	// individual packets can be much smaller (e.g., a simple SELECT batch).
+	if length < uint16(kMSSQLHeaderLen) || length > kMSSQLMaxPacketSize {
 		return false
 	}
 
@@ -147,34 +155,35 @@ func handleMSSQL(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffe
 	case kMSSQLBatch:
 		op, table, stmt = mssqlPreparedStatements(requestBuffer)
 	case kMSSQLRPC:
-		procID, payload := parseMSSQLRPC(reqRaw)
-		switch procID {
-		case kMSSQLProcIDPrepExec:
-			// Extract SQL from payload
-			text := ucs2ToUTF8(payload)
-			op, table, stmt = detectSQL(text)
-		case kMSSQLProcIDPrepare:
-			// Extract SQL and cache it
-			text := ucs2ToUTF8(payload)
-			_, _, stmt = detectSQL(text)
-			handle := parseHandleFromPrepareResponse(respRaw)
-			if handle != 0 && stmt != "" {
-				parseCtx.mssqlPreparedStatements.Add(mssqlPreparedStatementsKey{
-					connInfo: event.ConnInfo,
-					stmtID:   handle,
-				}, stmt)
-				return span, errIgnore
-			}
-		case kMSSQLProcIDExecute:
-			handle := parseHandleFromExecute(payload)
-			if handle != 0 {
-				var found bool
-				stmt, found = parseCtx.mssqlPreparedStatements.Get(mssqlPreparedStatementsKey{
-					connInfo: event.ConnInfo,
-					stmtID:   handle,
-				})
-				if found {
-					op, table = sqlprune.SQLParseOperationAndTable(stmt)
+		procID, r, err := parseMSSQLRPC(requestBuffer)
+		if err == nil {
+			payload := r.Bytes()
+			switch procID {
+			case kMSSQLProcIDPrepExec:
+				text := ucs2ToUTF8(payload)
+				op, table, stmt = detectSQL(text)
+			case kMSSQLProcIDPrepare:
+				text := ucs2ToUTF8(payload)
+				_, _, stmt = detectSQL(text)
+				handle := parseHandleFromPrepareResponse(responseBuffer)
+				if handle != 0 && stmt != "" {
+					parseCtx.mssqlPreparedStatements.Add(mssqlPreparedStatementsKey{
+						connInfo: event.ConnInfo,
+						stmtID:   handle,
+					}, stmt)
+					return span, errIgnore
+				}
+			case kMSSQLProcIDExecute:
+				handle := parseHandleFromExecute(r)
+				if handle != 0 {
+					var found bool
+					stmt, found = parseCtx.mssqlPreparedStatements.Get(mssqlPreparedStatementsKey{
+						connInfo: event.ConnInfo,
+						stmtID:   handle,
+					})
+					if found {
+						op, table = sqlprune.SQLParseOperationAndTable(stmt)
+					}
 				}
 			}
 		}
@@ -191,125 +200,123 @@ func handleMSSQL(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffe
 	return TCPToSQLToSpan(event, op, table, stmt, request.DBMSSQL, sqlCommand, sqlError), nil
 }
 
-func parseMSSQLRPC(b []byte) (uint16, []byte) {
-	if len(b) < kMSSQLHeaderLen+2 {
-		return 0, nil
+func parseMSSQLRPC(b *largebuf.LargeBuffer) (uint16, largebuf.LargeBufferReader, error) {
+	if b.Len() < kMSSQLHeaderLen+2 {
+		return 0, largebuf.LargeBufferReader{}, errFallback
 	}
-	data := b[kMSSQLHeaderLen:]
-	nameLen := binary.LittleEndian.Uint16(data[:2])
-	data = data[2:]
+
+	r, err := b.NewLimitedReader(kMSSQLHeaderLen, b.Len())
+	if err != nil {
+		return 0, largebuf.LargeBufferReader{}, err
+	}
+
+	nameLen, err := r.ReadU16LE()
+	if err != nil {
+		return 0, r, err
+	}
 
 	var procID uint16
 	if nameLen == 0xFFFF {
-		if len(data) < 2 {
-			return 0, nil
-		}
-		procID = binary.LittleEndian.Uint16(data[:2])
-		data = data[2:]
+		// ProcID follows NameLen when it is 0xFFFF
+		procID, err = r.ReadU16LE()
 	} else {
-		skip := int(nameLen) * 2
-		if len(data) < skip {
-			return 0, nil
-		}
-		data = data[skip:]
+		// Skip the name string (UCS-2, so 2 bytes per char)
+		err = r.Skip(int(nameLen) * 2)
 	}
-	// Skip options
-	if len(data) < 2 {
-		return procID, nil
+
+	if err != nil {
+		return 0, r, err
 	}
-	data = data[2:]
-	return procID, data
+	
+	if err := r.Skip(2); err != nil {
+		return procID, r, err
+	}
+
+	// Return the reader positioned at the payload
+	return procID, r, nil
 }
 
-func parseHandleFromExecute(data []byte) uint32 {
-	if len(data) < 3 {
+func parseHandleFromExecute(r largebuf.LargeBufferReader) uint32 {
+	// 1. Read NameLen (1 byte)
+	nameLen, err := r.ReadU8()
+	if err != nil {
 		return 0
 	}
-	nameLen := int(data[0])
-	data = data[1:]
-	if len(data) < nameLen*2+2 {
+
+	// 2. Skip Name (UCS-2)
+	if err := r.Skip(int(nameLen) * 2); err != nil {
 		return 0
 	}
-	data = data[nameLen*2:] // skip name
 
-	// status
-	data = data[1:]
+	// 3. Skip Status
+	if err := r.Skip(1); err != nil {
+		return 0
+	}
 
-	// type
-	typ := data[0]
-	data = data[1:]
+	// 4. Read TypeInfo
+	typ, err := r.ReadU8()
+	if err != nil {
+		return 0
+	}
 
 	switch typ {
 	case 0x26: // TI_INT4
-		if len(data) < 4 {
-			return 0
-		}
-		return binary.LittleEndian.Uint32(data[:4])
+		val, _ := r.ReadU32LE()
+		return val
 	case 0x38: // TI_INTN
-		if len(data) < 5 {
-			return 0
-		}
-		length := data[0]
-		data = data[1:]
-		if length == 4 {
-			return binary.LittleEndian.Uint32(data[:4])
+		length, err := r.ReadU8()
+		if err == nil && length == 4 {
+			val, _ := r.ReadU32LE()
+			return val
 		}
 	}
 	return 0
 }
 
-func parseHandleFromPrepareResponse(b []byte) uint32 {
-	if len(b) < kMSSQLHeaderLen {
+func parseHandleFromPrepareResponse(b *largebuf.LargeBuffer) uint32 {
+	if b.Len() < kMSSQLHeaderLen {
 		return 0
 	}
-	data := b[kMSSQLHeaderLen:]
+
+	r, err := b.NewLimitedReader(kMSSQLHeaderLen, b.Len())
+	if err != nil {
+		return 0
+	}
 
 	// Scan for RETURNVALUE token (0xAC)
-	// This token is used to send the return value of an RPC or UDF back to the client.
-	for i := 0; i < len(data); i++ {
-		if data[i] == kMSSQLTokenReturnValue {
-			curr := data[i+1:]
-			if len(curr) < 3 {
-				continue
-			}
-			// Ordinal (2)
-			curr = curr[2:]
-			// NameLen (1)
-			nameLen := int(curr[0])
-			curr = curr[1:]
-			if len(curr) < nameLen*2+kMSSQLReturnValueMetadataLen {
-				continue
-			}
-			curr = curr[nameLen*2:] // skip name
+	for {
+		idx := r.IndexByte(kMSSQLTokenReturnValue)
+		if idx < 0 {
+			break
+		}
 
-			// Status (1)
-			curr = curr[kMSSQLStatusLen:]
-			// UserType (4)
-			curr = curr[kMSSQLUserTypeLen:]
-			// Flags (2)
-			curr = curr[kMSSQLFlagsLen:]
+		_ = r.Skip(idx + 1)
 
-			// TypeInfo
-			if len(curr) < 1 {
-				continue
+		if r.Remaining() < 3 {
+			continue
+		}
+
+		_ = r.Skip(2) // Ordinal
+		nameLen, _ := r.ReadU8()
+
+		metadataLen := int(nameLen)*2 + kMSSQLReturnValueMetadataLen
+		if r.Remaining() < metadataLen+1 {
+			continue
+		}
+
+		_ = r.Skip(metadataLen)
+		typ, _ := r.ReadU8()
+
+		if typ == 0x26 { // TI_INT4
+			if r.Remaining() >= 4 {
+				val, _ := r.ReadU32LE()
+				return val
 			}
-			typ := curr[0]
-			curr = curr[1:]
-
-			if typ == 0x26 { // TI_INT4
-				if len(curr) < 4 {
-					continue
-				}
-				return binary.LittleEndian.Uint32(curr[:4])
-			} else if typ == 0x38 { // TI_INTN
-				if len(curr) < 1 {
-					continue
-				}
-				length := curr[0]
-				curr = curr[1:]
-				if length == 4 && len(curr) >= 4 {
-					return binary.LittleEndian.Uint32(curr[:4])
-				}
+		} else if typ == 0x38 { // TI_INTN
+			length, _ := r.ReadU8()
+			if length == 4 && r.Remaining() >= 4 {
+				val, _ := r.ReadU32LE()
+				return val
 			}
 		}
 	}

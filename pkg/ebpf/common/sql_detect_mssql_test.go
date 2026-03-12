@@ -166,7 +166,8 @@ func TestParseMSSQLRPC(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			procID, _ := parseMSSQLRPC(tt.buf)
+			procID, _, err := parseMSSQLRPC(largebuf.NewLargeBufferFrom(tt.buf))
+			assert.NoError(t, err)
 			assert.Equal(t, tt.wantProcID, procID)
 		})
 	}
@@ -209,7 +210,8 @@ func TestParseHandleFromExecute(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handle := parseHandleFromExecute(tt.payload)
+			r := largebuf.NewLargeBufferFrom(tt.payload).NewReader()
+			handle := parseHandleFromExecute(r)
 			assert.Equal(t, tt.wantHandle, handle)
 		})
 	}
@@ -256,7 +258,7 @@ func TestParseHandleFromPrepareResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handle := parseHandleFromPrepareResponse(tt.buf)
+			handle := parseHandleFromPrepareResponse(largebuf.NewLargeBufferFrom(tt.buf))
 			assert.Equal(t, tt.wantHandle, handle)
 		})
 	}
