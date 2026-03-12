@@ -103,8 +103,6 @@ static __always_inline u8 is_mssql(connection_info_t *conn_info,
 }
 
 // Emit a large buffer event for MSSQL protocol.
-// The return value is used to control the flow for this specific protocol.
-// -1: wait additional data; 0: continue, regardless of errors.
 static __always_inline int mssql_send_large_buffer(tcp_req_t *req,
                                                    const void *u_buf,
                                                    u32 bytes_len,
